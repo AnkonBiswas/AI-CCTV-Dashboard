@@ -1,0 +1,22 @@
+# MediaMTX Configuration
+logLevel: info
+logDestinations: [stdout]
+
+# API for programmatic control
+api: yes
+apiAddress: 127.0.0.1:9997
+
+# ── HLS ───────────────────────────────────────────────────────
+hls: yes
+hlsAddress: :8888
+hlsAlwaysRemux: yes
+hlsAllowOrigins: ["*"]
+hlsVariant: fmp4
+hlsTrustedProxies: []
+hlsEncryption: no
+hlsSegmentDuration: 1s
+
+# RTSP to HLS path publishing
+paths:
+  all_others:
+    source: publisher

@@ -1,0 +1,5 @@
+{
+  "source": "rtsp://192.168.1.4:8080/h264.sdp",
+  "sourceOnDemand": false,
+  "rtspTransport": "automatic"
+}

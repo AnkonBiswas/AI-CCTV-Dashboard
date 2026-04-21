@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CCTV Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>CCTV Dashboard</h1>
+  </header>
+
+  <section class="panel">
+    <h2>Add camera</h2>
+    <form id="add-camera-form">
+      <input name="cameraName" placeholder="Camera name" required>
+      <input name="rtspUrl" placeholder="rtsp://..." required>
+      <button type="submit">Add</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>Enroll person</h2>
+    <form id="enroll-form">
+      <input name="name" placeholder="Person name" required>
+      <input name="image" type="file" accept="image/*" required>
+      <button type="submit">Enroll</button>
+    </form>
+    <ul id="enrollments"></ul>
+  </section>
+
+  <main id="grid"></main>
+
+  <script src="app.js"></script>
+</body>
+</html>
