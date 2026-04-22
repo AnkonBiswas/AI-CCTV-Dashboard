@@ -25,48 +25,68 @@ const server = createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 const activeStreams = new Map();
-const aiProcesses = new Map();
 
-function spawnDetector(streamId, rtspUrl) {
-  const proc = spawn(PYTHON, ['-u', DETECTOR, rtspUrl, streamId], {
+// ── Single shared AI worker process ──────────────────────────
+let masterWorker = null;
+let workerBuf = '';
+
+function startMasterWorker() {
+  console.log('[AI] Starting master detection worker...');
+  masterWorker = spawn(PYTHON, ['-u', DETECTOR], {
     cwd: path.dirname(DETECTOR),
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
 
-  let buf = '';
-  proc.stdout.on('data', (chunk) => {
-    buf += chunk.toString();
+  masterWorker.stdout.on('data', (chunk) => {
+    workerBuf += chunk.toString();
     let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).trim();
-      buf = buf.slice(nl + 1);
+    while ((nl = workerBuf.indexOf('\n')) >= 0) {
+      const line = workerBuf.slice(0, nl).trim();
+      workerBuf = workerBuf.slice(nl + 1);
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
         if (msg.type === 'detections') {
-          io.emit('face_detections', {
-            streamId: msg.streamId,
-            detections: msg.detections,
-          });
+          io.emit('face_detections', { streamId: msg.streamId, detections: msg.detections });
         } else {
-          console.log(`[worker ${streamId}] ${msg.type || 'msg'}: ${msg.message || line}`);
+          console.log(`[AI] ${msg.type}: ${msg.message || line}`);
         }
       } catch {
-        console.log(`[worker ${streamId}] ${line}`);
+        console.log(`[AI] ${line}`);
       }
     }
   });
 
-  proc.stderr.on('data', (d) =>
-    console.error(`[worker ${streamId} stderr] ${d.toString().trim()}`),
-  );
-  proc.on('exit', (code) => {
-    console.log(`[worker ${streamId}] exited with ${code}`);
-    aiProcesses.delete(streamId);
+  masterWorker.stderr.on('data', (d) => {
+    const txt = d.toString().trim();
+    // Suppress TFLite/XNNPACK noise
+    if (!txt.includes('INFO:') && !txt.includes('XNNPACK') && !txt.includes('feedback')) {
+      console.error(`[AI stderr] ${txt}`);
+    }
   });
 
-  return proc;
+  masterWorker.on('exit', (code) => {
+    console.log(`[AI] Worker exited (${code}) — restarting in 3s`);
+    masterWorker = null;
+    // Re-register all active streams after restart
+    setTimeout(() => {
+      startMasterWorker();
+      for (const [streamId, s] of activeStreams) {
+        sendWorkerCmd({ cmd: 'add', streamId, rtspUrl: s.rtspUrl });
+      }
+    }, 3000);
+  });
 }
 
+function sendWorkerCmd(obj) {
+  if (masterWorker && masterWorker.stdin.writable) {
+    masterWorker.stdin.write(JSON.stringify(obj) + '\n');
+  }
+}
+
+startMasterWorker();
+
+// ── Camera routes ─────────────────────────────────────────────
 app.post('/add-camera', async (req, res) => {
   const { rtspUrl, cameraName } = req.body || {};
   if (!rtspUrl || !cameraName) {
@@ -77,7 +97,6 @@ app.post('/add-camera', async (req, res) => {
   const pathName = `camera_${streamId}`;
 
   try {
-    // sourceOnDemand: false — worker needs the stream even when no browser is watching.
     await axios.post(`${MEDIAMTX_API}/v3/config/paths/add/${pathName}`, {
       source: rtspUrl,
       sourceOnDemand: false,
@@ -89,10 +108,13 @@ app.post('/add-camera', async (req, res) => {
   }
 
   const hlsUrl = `${HLS_BASE}/${pathName}/`;
+  // Use MediaMTX's local re-stream so the phone only receives ONE connection.
+  // MediaMTX → Python is local loopback; Phone → MediaMTX is the only external link.
+  const localRtspUrl = `rtsp://localhost:8554/${pathName}`;
   activeStreams.set(streamId, { cameraName, rtspUrl, pathName, hlsUrl });
 
-  const proc = spawnDetector(streamId, rtspUrl);
-  aiProcesses.set(streamId, proc);
+  // Tell the single worker to process via local MediaMTX RTSP (not the phone directly)
+  sendWorkerCmd({ cmd: 'add', streamId, rtspUrl: localRtspUrl });
 
   res.json({ streamId, cameraName, hlsUrl });
 });
@@ -102,11 +124,8 @@ app.delete('/camera/:id', async (req, res) => {
   const stream = activeStreams.get(id);
   if (!stream) return res.status(404).json({ error: 'stream not found' });
 
-  const proc = aiProcesses.get(id);
-  if (proc) {
-    try { proc.kill(); } catch {}
-    aiProcesses.delete(id);
-  }
+  // Tell worker to stop this stream's thread
+  sendWorkerCmd({ cmd: 'remove', streamId: id });
 
   try {
     await axios.post(`${MEDIAMTX_API}/v3/config/paths/remove/${stream.pathName}`);
@@ -124,6 +143,7 @@ app.get('/cameras', (_req, res) => {
   );
 });
 
+// ── Enrollment routes ─────────────────────────────────────────
 function sanitizeName(name) {
   return String(name || '')
     .replace(/[^a-zA-Z0-9 _-]/g, '')
@@ -143,12 +163,17 @@ app.post('/enroll', (req, res) => {
   const ext = m ? (m[1].toLowerCase() === 'jpeg' ? 'jpg' : m[1].toLowerCase()) : 'jpg';
   const data = m ? m[2] : imageBase64;
 
-  for (const e of ['jpg', 'jpeg', 'png']) {
-    const p = path.join(ENROLLMENT_DIR, `${safe}.${e}`);
-    if (fs.existsSync(p)) fs.unlinkSync(p);
+  // Find next available numbered slot for this person
+  let index = 1;
+  let filePath;
+  while (true) {
+    const exists = ['jpg', 'jpeg', 'png'].some((e) =>
+      fs.existsSync(path.join(ENROLLMENT_DIR, `${safe}_${index}.${e}`)),
+    );
+    if (!exists) { filePath = path.join(ENROLLMENT_DIR, `${safe}_${index}.${ext}`); break; }
+    index++;
   }
 
-  const filePath = path.join(ENROLLMENT_DIR, `${safe}.${ext}`);
   try {
     fs.writeFileSync(filePath, Buffer.from(data, 'base64'));
   } catch (err) {
@@ -156,7 +181,7 @@ app.post('/enroll', (req, res) => {
   }
 
   fs.utimesSync(ENROLLMENT_DIR, new Date(), new Date());
-  res.json({ name: safe });
+  res.json({ name: safe, index });
 });
 
 app.get('/enrollments', (_req, res) => {
@@ -173,12 +198,13 @@ app.get('/enrollments', (_req, res) => {
 app.delete('/enrollment/:name', (req, res) => {
   const safe = sanitizeName(req.params.name);
   let removed = 0;
-  for (const ext of ['jpg', 'jpeg', 'png']) {
-    const p = path.join(ENROLLMENT_DIR, `${safe}.${ext}`);
-    if (fs.existsSync(p)) {
-      fs.unlinkSync(p);
-      removed++;
-    }
+  // Delete all numbered variants: name_1.jpg, name_2.jpg, etc.
+  const files = fs.readdirSync(ENROLLMENT_DIR).filter((f) =>
+    new RegExp(`^${safe}(_\\d+)?\\.(jpg|jpeg|png)$`, 'i').test(f),
+  );
+  for (const f of files) {
+    fs.unlinkSync(path.join(ENROLLMENT_DIR, f));
+    removed++;
   }
   if (removed) fs.utimesSync(ENROLLMENT_DIR, new Date(), new Date());
   res.json({ removed });
@@ -186,18 +212,23 @@ app.delete('/enrollment/:name', (req, res) => {
 
 app.get('/enrollment/:name/image', (req, res) => {
   const safe = sanitizeName(req.params.name);
+  // Serve first image found for this name
   for (const ext of ['jpg', 'jpeg', 'png']) {
+    const p1 = path.join(ENROLLMENT_DIR, `${safe}_1.${ext}`);
+    if (fs.existsSync(p1)) return res.sendFile(p1);
     const p = path.join(ENROLLMENT_DIR, `${safe}.${ext}`);
     if (fs.existsSync(p)) return res.sendFile(p);
   }
   res.status(404).end();
 });
 
+// ── Shutdown ──────────────────────────────────────────────────
 process.on('SIGINT', () => {
-  for (const proc of aiProcesses.values()) {
-    try { proc.kill(); } catch {}
-  }
-  process.exit(0);
+  sendWorkerCmd({ cmd: 'quit' });
+  setTimeout(() => {
+    if (masterWorker) masterWorker.kill();
+    process.exit(0);
+  }, 500);
 });
 
 server.listen(PORT, () => console.log(`Backend listening on :${PORT}`));

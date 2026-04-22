@@ -16,16 +16,15 @@ function makeTile(streamId, cameraName, hlsUrl) {
   tile.className = 'tile';
   tile.innerHTML = `
     <div class="title">
-      <span></span>
-      <button class="remove" title="Remove">×</button>
+      <span>${cameraName}</span>
+      <button class="remove" title="Remove Tracking">×</button>
     </div>
     <div class="video-wrap">
       <video autoplay muted playsinline></video>
       <canvas></canvas>
     </div>
-    <div class="stats">connecting…</div>
+    <div class="stats">LOG: SYNCHRONIZING_STREAM...</div>
   `;
-  tile.querySelector('.title span').textContent = cameraName;
   grid.appendChild(tile);
 
   const video = tile.querySelector('video');
@@ -42,10 +41,58 @@ function makeTile(streamId, cameraName, hlsUrl) {
 
   const src = hlsUrl + 'index.m3u8';
   if (window.Hls && Hls.isSupported()) {
-    const hls = new Hls({ lowLatencyMode: true });
+    const hls = new Hls({
+      lowLatencyMode: true,
+      enableWorker: true,
+      backBufferLength: 8,
+      maxBufferLength: 8,
+      maxMaxBufferLength: 15,
+      liveSyncDuration: 2,
+      liveMaxLatencyDuration: 6,
+      liveDurationInfinity: true,
+      maxLiveSyncPlaybackRate: 1.5,
+    });
     hls.loadSource(src);
     hls.attachMedia(video);
     cam.hls = hls;
+
+    // ── Auto-recovery: handle network/media errors ──────────
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (!data.fatal) return;
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        console.warn(`[${cameraName}] Network error — retrying`);
+        setTimeout(() => hls.startLoad(), 1000);
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        console.warn(`[${cameraName}] Media error — recovering`);
+        hls.recoverMediaError();
+      } else {
+        console.warn(`[${cameraName}] Fatal error — reloading source`);
+        setTimeout(() => { hls.loadSource(src); hls.startLoad(); }, 2000);
+      }
+    });
+
+    // ── Stall watchdog: jump to live edge if video freezes ──
+    let lastTime = 0;
+    let stalledFor = 0;
+    cam.stallWatchdog = setInterval(() => {
+      if (video.paused || video.ended || !video.src) return;
+      if (video.currentTime === lastTime) {
+        stalledFor += 1;
+        if (stalledFor >= 4) {  // stalled for ~4s
+          console.warn(`[${cameraName}] Stall detected — jumping to live edge`);
+          const levels = hls.levels;
+          if (hls.liveSyncPosition != null) {
+            video.currentTime = hls.liveSyncPosition;
+          }
+          video.play().catch(() => {});
+          stalledFor = 0;
+        }
+      } else {
+        stalledFor = 0;
+        lastTime = video.currentTime;
+      }
+    }, 1000);
+
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
     video.src = src;
   }
@@ -78,33 +125,41 @@ function drawDetections(cam) {
 
   let named = 0;
   for (const d of lastDetections) {
-    // Worker emits relative coords in 0..1 of source frame; we multiply by
-    // canvas size which tracks the rendered <video> element.
     const x = d.x * canvas.width;
     const y = d.y * canvas.height;
     const w = d.w * canvas.width;
     const h = d.h * canvas.height;
 
-    const color = d.name ? '#00ff88' : '#ffcc00';
+    const color = d.name ? '#00ff88' : '#00f2ff'; // Green for recognized, Cyan for person
+    const glowColor = d.name ? 'rgba(0, 255, 136, 0.3)' : 'rgba(0, 242, 255, 0.3)';
+
+    // Bounding Box Glow
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = color;
     ctx.lineWidth = 2;
     ctx.strokeStyle = color;
     ctx.strokeRect(x, y, w, h);
+    ctx.shadowBlur = 0;
 
+    // Label
     const label = d.name
-      ? `${d.name} (${Math.round(d.confidence * 100)}%)`
-      : `${d.label} ${Math.round(d.confidence * 100)}%`;
-    ctx.font = '14px system-ui, sans-serif';
-    const textW = ctx.measureText(label).width + 8;
+      ? `ID: ${d.name.toUpperCase()} (${Math.round(d.confidence * 100)}%)`
+      : `OBJ: ${d.label.toUpperCase()} ${Math.round(d.confidence * 100)}%`;
+    
+    ctx.font = 'bold 12px Inter, system-ui, sans-serif';
+    const textW = ctx.measureText(label).width + 12;
+    
     ctx.fillStyle = color;
-    ctx.fillRect(x, Math.max(0, y - 18), textW, 18);
-    ctx.fillStyle = '#111';
-    ctx.fillText(label, x + 4, Math.max(12, y - 4));
+    ctx.fillRect(x, Math.max(0, y - 22), textW, 22);
+    
+    ctx.fillStyle = '#000';
+    ctx.fillText(label, x + 6, Math.max(16, y - 6));
 
     if (d.name) named++;
   }
   stats.textContent = lastDetections.length
-    ? `${lastDetections.length} detection(s)` + (named ? ` — ${named} identified` : '')
-    : 'no detections';
+    ? `DETECTION_ALERT: ${lastDetections.length} ACTIVE` + (named ? ` | VERIFIED: ${named}` : '')
+    : 'MONITORING: NO_TARGETS';
 }
 
 async function addCamera({ cameraName, rtspUrl }) {
@@ -127,6 +182,7 @@ async function removeCamera(streamId) {
   await fetch(`${API}/camera/${streamId}`, { method: 'DELETE' });
   if (cam.hls) cam.hls.destroy();
   if (cam.clearTimer) clearInterval(cam.clearTimer);
+  if (cam.stallWatchdog) clearInterval(cam.stallWatchdog);
   cam.tile.remove();
   cameras.delete(streamId);
 }
@@ -190,4 +246,14 @@ async function refreshEnrollments() {
   }
 }
 
+async function refreshCameras() {
+  const list = await (await fetch(`${API}/cameras`)).json();
+  for (const { streamId, cameraName, hlsUrl } of list) {
+    if (!cameras.has(streamId)) {
+      makeTile(streamId, cameraName, hlsUrl);
+    }
+  }
+}
+
 refreshEnrollments();
+refreshCameras();

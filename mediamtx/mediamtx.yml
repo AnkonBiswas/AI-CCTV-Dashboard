@@ -6,17 +6,22 @@ logDestinations: [stdout]
 api: yes
 apiAddress: 127.0.0.1:9997
 
-# ── HLS ───────────────────────────────────────────────────────
+# ── RTSP Server (used by Python worker for local re-streaming) ─
+rtsp: yes
+rtspAddress: :8554
+
+# ── HLS Settings ───────────────────────────────────────────────
 hls: yes
 hlsAddress: :8888
-hlsAlwaysRemux: yes
+hlsAlwaysRemux: no             # Only transcode when browser is watching (saves CPU)
 hlsAllowOrigins: ["*"]
-hlsVariant: fmp4
+hlsVariant: mpegts             # Lighter than fmp4, lower CPU per stream
 hlsTrustedProxies: []
 hlsEncryption: no
-hlsSegmentDuration: 1s
+hlsSegmentDuration: 1s         # 1s gives MediaMTX enough time per segment for multi-stream
+hlsSegmentCount: 6             # More segments = more buffer room during CPU spikes
 
-# RTSP to HLS path publishing
+# RTSP paths — always pull from camera (Python reads RTSP directly)
 paths:
   all_others:
     source: publisher

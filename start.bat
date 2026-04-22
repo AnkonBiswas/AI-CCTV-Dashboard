@@ -1,25 +1,36 @@
 @echo off
-echo Starting RTSP Dashboard...
+title AI Face Recognition Dashboard
+echo ==========================================
+echo Starting AI Face Recognition System...
+echo ==========================================
 
-:: Start MediaMTX in a new window
-echo Starting MediaMTX...
+:: Kill existing processes to prevent port conflicts
+echo [1/4] Cleaning up existing services...
+taskkill /f /im node.exe >nul 2>&1
+taskkill /f /im python.exe >nul 2>&1
+taskkill /f /im mediamtx.exe >nul 2>&1
+
+:: Start MediaMTX
+echo [2/4] Starting MediaMTX (Stream Server)...
 cd mediamtx
-start "MediaMTX" mediamtx.exe
-timeout /t 3
+start "MediaMTX" /min mediamtx.exe
+timeout /t 3 /nobreak >nul
 
-:: Start Backend in a new window
-echo Starting Backend...
+:: Start Backend
+echo [3/4] Starting Backend (AI Controller)...
 cd ..\backend
-start "Backend" npm start
-timeout /t 2
+start "Dashboard Backend" /min npm start
+timeout /t 2 /nobreak >nul
 
-:: Serve Frontend using python or npx
-echo Starting Frontend...
+:: Start Frontend
+echo [4/4] Starting Frontend (Interface)...
 cd ..\frontend
-start "Frontend" python -m http.server 8080
+start "Dashboard Frontend" /min python -m http.server 8080
 
 echo.
-echo All services running!
-echo Dashboard: http://localhost:8080
+echo ==========================================
+echo  SYSTEM READY
+echo  Dashboard: http://localhost:8080
+echo ==========================================
 echo.
 pause

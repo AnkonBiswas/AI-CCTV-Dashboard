@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <title>CCTV Dashboard</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
   <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
 </head>
@@ -12,24 +15,34 @@
     <h1>CCTV Dashboard</h1>
   </header>
 
-  <section class="panel">
-    <h2>Add camera</h2>
-    <form id="add-camera-form">
-      <input name="cameraName" placeholder="Camera name" required>
-      <input name="rtspUrl" placeholder="rtsp://..." required>
-      <button type="submit">Add</button>
-    </form>
-  </section>
+  <div class="sidebar">
+    <section class="panel">
+      <h2>Add New Camera</h2>
+      <form id="add-camera-form">
+        <div class="input-group">
+          <input name="cameraName" placeholder="Camera identification" required>
+        </div>
+        <div class="input-group">
+          <input name="rtspUrl" placeholder="rtsp://address:port/path" required>
+        </div>
+        <button type="submit" class="btn-primary">Add Stream</button>
+      </form>
+    </section>
 
-  <section class="panel">
-    <h2>Enroll person</h2>
-    <form id="enroll-form">
-      <input name="name" placeholder="Person name" required>
-      <input name="image" type="file" accept="image/*" required>
-      <button type="submit">Enroll</button>
-    </form>
-    <ul id="enrollments"></ul>
-  </section>
+    <section class="panel">
+      <h2>Biometric Enrollment</h2>
+      <form id="enroll-form">
+        <input name="name" placeholder="Full name" required>
+        <label class="file-input">
+          <span>Choose Image</span>
+          <input name="image" type="file" accept="image/*" required>
+        </label>
+        <button type="submit" class="btn-secondary">Enroll Agent</button>
+      </form>
+      <div class="enrollment-list-header">Live Database</div>
+      <ul id="enrollments"></ul>
+    </section>
+  </div>
 
   <main id="grid"></main>
 

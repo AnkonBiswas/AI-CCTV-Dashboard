@@ -1,21 +1,47 @@
-import sys
-import os
-import json
-import time
-import cv2
-from ultralytics import YOLO
-
-try:
-    import face_recognition
-    FACE_REC_AVAILABLE = True
-except Exception:
-    FACE_REC_AVAILABLE = False
+"""
+Multi-stream AI worker.
+Reads JSON commands from stdin:
+  {"cmd":"add",    "streamId":"...", "rtspUrl":"..."}
+  {"cmd":"remove", "streamId":"..."}
+  {"cmd":"quit"}
+Writes JSON detections to stdout.
+"""
+import sys, os, json, time, threading, re
+import cv2, numpy as np, mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENROLLMENT_DIR = os.path.join(HERE, 'enrollments')
-FRAME_SKIP = 3
-PERSON_CONF = 0.4
-FACE_MATCH_THRESHOLD = 0.6
+MODEL_PATH = os.path.join(HERE, 'blaze_face_short_range.tflite')
+FRAME_SKIP = 2               # process every Nth frame per stream
+RECOGNITION_THRESHOLD = 115
+
+# ── Download model if needed ──────────────────────────────────
+if not os.path.exists(MODEL_PATH):
+    import urllib.request
+    sys.stdout.write(json.dumps({'type': 'info', 'message': 'Downloading face model...'}) + '\n')
+    sys.stdout.flush()
+    urllib.request.urlretrieve(
+        'https://storage.googleapis.com/mediapipe-models/face_detector/'
+        'blaze_face_short_range/float16/latest/blaze_face_short_range.tflite',
+        MODEL_PATH)
+
+# ── Single shared detector (thread-safe in MediaPipe Tasks) ──
+base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+detector_options = mp_vision.FaceDetectorOptions(
+    base_options=base_options,
+    min_detection_confidence=0.5,
+    min_suppression_threshold=0.3,
+)
+shared_detector = mp_vision.FaceDetector.create_from_options(detector_options)
+detector_lock = threading.Lock()
+
+# ── LBPH recognizer (shared, rebuilt on enrollment change) ───
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+names_map = {}
+recognizer_ready = False
+recognizer_lock = threading.Lock()
 
 
 def log(obj):
@@ -23,166 +49,171 @@ def log(obj):
     sys.stdout.flush()
 
 
-def pick_weights():
-    # Prefer face-specific weights if present, otherwise COCO. If neither file
-    # exists, returning the bare name lets ultralytics auto-download from the hub.
-    candidates = [
-        os.path.join(HERE, 'yolov8n-face.pt'),
-        'yolov8n-face.pt',
-        os.path.join(HERE, '..', 'yolov8n.pt'),
-        'yolov8n.pt',
-    ]
-    for c in candidates:
-        if os.path.exists(c) and os.path.getsize(c) > 1024:
-            return c
-    return 'yolov8n.pt'
+def train_recognizer():
+    global recognizer_ready, names_map
+    if not os.path.isdir(ENROLLMENT_DIR):
+        return
+    faces, labels, name_to_label, next_id = [], [], {}, [0]
 
+    def get_label(base):
+        if base not in name_to_label:
+            name_to_label[base] = next_id[0]
+            next_id[0] += 1
+        return name_to_label[base]
 
-def load_enrollments():
-    encodings, names = [], []
-    if not FACE_REC_AVAILABLE or not os.path.isdir(ENROLLMENT_DIR):
-        return encodings, names
     for fname in sorted(os.listdir(ENROLLMENT_DIR)):
         if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
             continue
         p = os.path.join(ENROLLMENT_DIR, fname)
-        try:
-            img = face_recognition.load_image_file(p)
-            encs = face_recognition.face_encodings(img)
-            if encs:
-                encodings.append(encs[0])
-                names.append(os.path.splitext(fname)[0])
-            else:
-                log({'type': 'warning', 'message': f'no face found in enrollment {fname}'})
-        except Exception as ex:
-            log({'type': 'warning', 'message': f'failed to load enrollment {fname}: {ex}'})
-    return encodings, names
+        img_bgr = cv2.imread(p)
+        if img_bgr is None:
+            continue
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        rgb  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        stem = os.path.splitext(fname)[0]
+        base = re.sub(r'_\d+$', '', stem)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        with detector_lock:
+            result = shared_detector.detect(mp_img)
+        if result.detections:
+            bb = result.detections[0].bounding_box
+            ih, iw = gray.shape
+            x = max(0, bb.origin_x); y = max(0, bb.origin_y)
+            w = min(bb.width, iw - x); h = min(bb.height, ih - y)
+            crop = gray[y:y+h, x:x+w]
+            if crop.size > 0:
+                faces.append(cv2.resize(crop, (120, 120)))
+                labels.append(get_label(base))
+                log({'type': 'info', 'message': f'Enrolled: {fname} -> {base}'})
+        else:
+            log({'type': 'warning', 'message': f'No face in enrollment: {fname}'})
+
+    with recognizer_lock:
+        if faces:
+            recognizer.train(faces, np.array(labels))
+            names_map = {v: k.replace('_', ' ') for k, v in name_to_label.items()}
+            recognizer_ready = True
+            summary = {names_map[l]: labels.count(l) for l in set(labels)}
+            log({'type': 'info', 'message': f'Trained: {summary}'})
+        else:
+            recognizer_ready = False
+            log({'type': 'warning', 'message': 'No faces enrolled — recognition disabled'})
 
 
-def main():
-    if len(sys.argv) < 3:
-        log({'type': 'error', 'message': 'usage: detect.py <rtsp_url> <stream_id>'})
-        return
+# ── Per-stream thread ─────────────────────────────────────────
+active_streams = {}   # streamId -> {'stop': Event}
 
-    rtsp_url = sys.argv[1]
-    stream_id = sys.argv[2]
 
-    weights = pick_weights()
-    try:
-        model = YOLO(weights)
-    except Exception as ex:
-        log({'type': 'error', 'message': f'YOLO load failed: {ex}'})
-        return
-
-    # Face-specific YOLO weights expose one class; COCO weights expose 80 with
-    # person == 0. The downstream logic branches on this.
-    is_face_model = len(model.names) == 1
-
-    if not FACE_REC_AVAILABLE:
-        log({'type': 'warning',
-             'message': 'face_recognition not installed — name matching disabled; '
-                        'pip install face_recognition to enable'})
-
-    enrollments, names = load_enrollments()
-    enrolled_mtime = os.path.getmtime(ENROLLMENT_DIR) if os.path.isdir(ENROLLMENT_DIR) else 0
-
+def stream_worker(stream_id, rtsp_url):
+    stop_event = active_streams[stream_id]['stop']
+    log({'type': 'info', 'message': f'Stream worker started: {stream_id}'})
+    enrolled_mtime = 0
     cap = None
     frame_idx = 0
 
-    while True:
+    while not stop_event.is_set():
+        # ── reconnect ──
         if cap is None or not cap.isOpened():
-            if cap is not None:
+            if cap:
                 cap.release()
             cap = cv2.VideoCapture(rtsp_url)
             if not cap.isOpened():
-                log({'type': 'warning', 'message': 'RTSP open failed; retry in 2s'})
+                log({'type': 'warning', 'message': f'[{stream_id[:8]}] RTSP open failed; retry 2s'})
                 time.sleep(2)
                 continue
 
         ret, frame = cap.read()
         if not ret:
-            log({'type': 'warning', 'message': 'frame read failed; reconnecting'})
-            cap.release()
-            cap = None
-            time.sleep(2)
-            continue
+            cap.release(); cap = None; time.sleep(1); continue
 
         frame_idx += 1
         if frame_idx % FRAME_SKIP != 0:
             continue
 
-        if FACE_REC_AVAILABLE and os.path.isdir(ENROLLMENT_DIR):
-            m = os.path.getmtime(ENROLLMENT_DIR)
-            if m != enrolled_mtime:
-                enrollments, names = load_enrollments()
-                enrolled_mtime = m
+        # ── auto-retrain on enrollment change ──
+        if os.path.isdir(ENROLLMENT_DIR):
+            mtime = os.path.getmtime(ENROLLMENT_DIR)
+            if mtime != enrolled_mtime:
+                enrolled_mtime = mtime
+                train_recognizer()
 
+        # ── detect ──
         h, w = frame.shape[:2]
-
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         try:
-            result = model.predict(frame, conf=PERSON_CONF, verbose=False)[0]
+            with detector_lock:
+                result = shared_detector.detect(mp_img)
         except Exception as ex:
-            log({'type': 'warning', 'message': f'YOLO predict failed: {ex}'})
-            continue
+            log({'type': 'warning', 'message': f'detect error: {ex}'}); continue
 
         detections = []
-        rgb = None
-
-        for box in result.boxes:
-            cls = int(box.cls[0])
-            if not is_face_model and cls != 0:  # keep only 'person' on COCO model
-                continue
-            conf = float(box.conf[0])
-            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
-
-            matched_name = None
-            if FACE_REC_AVAILABLE and enrollments:
-                if rgb is None:
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                if is_face_model:
-                    face_locs = [(int(y1), int(x2), int(y2), int(x1))]
-                else:
-                    # Search only the upper half of the person box to keep cost down.
-                    top_cut = max(0, int(y1))
-                    bot_cut = min(h, int(y1 + (y2 - y1) * 0.5))
-                    left_cut = max(0, int(x1))
-                    right_cut = min(w, int(x2))
-                    crop = rgb[top_cut:bot_cut, left_cut:right_cut]
-                    if crop.size == 0:
-                        face_locs = []
-                    else:
-                        locs = face_recognition.face_locations(crop, model='hog')
-                        face_locs = [(t + top_cut, r + left_cut,
-                                      b + top_cut, l + left_cut)
-                                     for (t, r, b, l) in locs]
-
-                if face_locs:
-                    try:
-                        encs = face_recognition.face_encodings(rgb, face_locs)
-                        if encs:
-                            dists = face_recognition.face_distance(enrollments, encs[0])
-                            best = int(dists.argmin())
-                            if float(dists[best]) < FACE_MATCH_THRESHOLD:
-                                matched_name = names[best]
-                    except Exception:
-                        pass
-
-            detections.append({
-                'x': x1 / w,
-                'y': y1 / h,
-                'w': (x2 - x1) / w,
-                'h': (y2 - y1) / h,
-                'confidence': conf,
-                'label': 'face' if is_face_model else 'person',
-                'name': matched_name,
-            })
+        if result.detections:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            for d in result.detections:
+                bb   = d.bounding_box
+                conf = d.categories[0].score if d.categories else 0.0
+                name = None
+                with recognizer_lock:
+                    if recognizer_ready:
+                        x = max(0, bb.origin_x); y = max(0, bb.origin_y)
+                        fw = min(bb.width, w - x); fh = min(bb.height, h - y)
+                        crop = gray[y:y+fh, x:x+fw]
+                        if crop.size > 0:
+                            crop = cv2.resize(crop, (120, 120))
+                            label, dist = recognizer.predict(crop)
+                            if dist < RECOGNITION_THRESHOLD:
+                                name = names_map.get(label)
+                detections.append({
+                    'x': bb.origin_x / w, 'y': bb.origin_y / h,
+                    'w': bb.width / w,    'h': bb.height / h,
+                    'confidence': float(conf), 'label': 'face', 'name': name,
+                })
 
         log({'type': 'detections', 'streamId': stream_id, 'detections': detections})
 
+    if cap:
+        cap.release()
+    log({'type': 'info', 'message': f'Stream worker stopped: {stream_id}'})
+
+
+# ── Main: read commands from stdin ────────────────────────────
+def main():
+    train_recognizer()
+    log({'type': 'ready', 'message': 'Multi-stream worker ready'})
+
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            cmd = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        action = cmd.get('cmd')
+
+        if action == 'add':
+            sid = cmd['streamId']
+            url = cmd['rtspUrl']
+            if sid not in active_streams:
+                stop_ev = threading.Event()
+                active_streams[sid] = {'stop': stop_ev}
+                t = threading.Thread(target=stream_worker, args=(sid, url), daemon=True)
+                t.start()
+                active_streams[sid]['thread'] = t
+
+        elif action == 'remove':
+            sid = cmd.get('streamId')
+            if sid in active_streams:
+                active_streams[sid]['stop'].set()
+                del active_streams[sid]
+
+        elif action == 'quit':
+            for info in active_streams.values():
+                info['stop'].set()
+            break
+
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
+    main()
