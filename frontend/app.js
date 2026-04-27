@@ -11,6 +11,14 @@ socket.on('face_detections', ({ streamId, detections }) => {
   drawDetections(cam);
 });
 
+socket.on('incident_detections', ({ streamId, incidents }) => {
+  const cam = cameras.get(streamId);
+  if (!cam) return;
+  cam.lastIncidents = incidents;
+  cam.lastIncidentUpdate = Date.now();
+  drawDetections(cam);
+});
+
 function makeTile(streamId, cameraName, hlsUrl) {
   const tile = document.createElement('div');
   tile.className = 'tile';
@@ -34,6 +42,7 @@ function makeTile(streamId, cameraName, hlsUrl) {
   const cam = {
     streamId, cameraName, tile, video, canvas, stats,
     lastDetections: [], lastUpdate: 0,
+    lastIncidents: [], lastIncidentUpdate: 0,
   };
   cameras.set(streamId, cam);
 
@@ -101,10 +110,17 @@ function makeTile(streamId, cameraName, hlsUrl) {
   window.addEventListener('resize', () => resizeCanvas(cam));
 
   cam.clearTimer = setInterval(() => {
-    if (Date.now() - cam.lastUpdate > 1000 && cam.lastDetections.length) {
+    const now = Date.now();
+    let changed = false;
+    if (now - cam.lastUpdate > 1000 && cam.lastDetections.length) {
       cam.lastDetections = [];
-      drawDetections(cam);
+      changed = true;
     }
+    if (now - cam.lastIncidentUpdate > 2000 && cam.lastIncidents.length) {
+      cam.lastIncidents = [];
+      changed = true;
+    }
+    if (changed) drawDetections(cam);
   }, 500);
 
   return cam;
@@ -119,10 +135,11 @@ function resizeCanvas(cam) {
 }
 
 function drawDetections(cam) {
-  const { canvas, lastDetections, stats } = cam;
+  const { canvas, lastDetections, lastIncidents, stats, tile } = cam;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+  // 1. Draw Regular Detections (Faces, Persons)
   let named = 0;
   for (const d of lastDetections) {
     const x = d.x * canvas.width;
@@ -130,10 +147,7 @@ function drawDetections(cam) {
     const w = d.w * canvas.width;
     const h = d.h * canvas.height;
 
-    const color = d.name ? '#00ff88' : '#00f2ff'; // Green for recognized, Cyan for person
-    const glowColor = d.name ? 'rgba(0, 255, 136, 0.3)' : 'rgba(0, 242, 255, 0.3)';
-
-    // Bounding Box Glow
+    const color = d.name ? '#00ff88' : (d.label === 'person' ? '#ffaa00' : '#00f2ff');
     ctx.shadowBlur = 10;
     ctx.shadowColor = color;
     ctx.lineWidth = 2;
@@ -141,25 +155,55 @@ function drawDetections(cam) {
     ctx.strokeRect(x, y, w, h);
     ctx.shadowBlur = 0;
 
-    // Label
     const label = d.name
       ? `ID: ${d.name.toUpperCase()} (${Math.round(d.confidence * 100)}%)`
       : `OBJ: ${d.label.toUpperCase()} ${Math.round(d.confidence * 100)}%`;
     
     ctx.font = 'bold 12px Inter, system-ui, sans-serif';
     const textW = ctx.measureText(label).width + 12;
-    
     ctx.fillStyle = color;
     ctx.fillRect(x, Math.max(0, y - 22), textW, 22);
-    
     ctx.fillStyle = '#000';
     ctx.fillText(label, x + 6, Math.max(16, y - 6));
-
     if (d.name) named++;
   }
-  stats.textContent = lastDetections.length
-    ? `DETECTION_ALERT: ${lastDetections.length} ACTIVE` + (named ? ` | VERIFIED: ${named}` : '')
-    : 'MONITORING: NO_TARGETS';
+
+  // 2. Draw Incidents (Fire, Fighting)
+  for (const inc of lastIncidents) {
+    const [ix1, iy1, ix2, iy2] = inc.box;
+    const x = ix1 * canvas.width;
+    const y = iy1 * canvas.height;
+    const w = (ix2 - ix1) * canvas.width;
+    const h = (iy2 - iy1) * canvas.height;
+
+    const color = '#ff0000'; // High alert Red
+    ctx.shadowBlur = 20;
+    ctx.shadowColor = 'red';
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = color;
+    ctx.strokeRect(x, y, w, h);
+    
+    // Alert Banner
+    const label = `⚠️ CRITICAL: ${inc.type.toUpperCase()}`;
+    ctx.font = 'bold 14px Inter, system-ui, sans-serif';
+    const textW = ctx.measureText(label).width + 16;
+    ctx.fillStyle = 'red';
+    ctx.fillRect(x, Math.max(0, y - 28), textW, 28);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, x + 8, Math.max(20, y - 8));
+  }
+
+  // 3. UI State
+  const alertCount = lastIncidents.length;
+  if (alertCount > 0) {
+    tile.classList.add('incident-alert');
+    stats.innerHTML = `<span style="color: #ff4444; font-weight: 800; animation: blink 0.5s infinite">🚨 INCIDENT DETECTED: ${lastIncidents[0].type.toUpperCase()}</span>`;
+  } else {
+    tile.classList.remove('incident-alert');
+    stats.textContent = lastDetections.length
+      ? `DETECTION_ALERT: ${lastDetections.length} ACTIVE` + (named ? ` | VERIFIED: ${named}` : '')
+      : 'MONITORING: NO_TARGETS';
+  }
 }
 
 async function addCamera({ cameraName, rtspUrl }) {

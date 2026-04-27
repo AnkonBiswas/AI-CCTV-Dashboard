@@ -345,3 +345,24 @@ button {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--panel-border); border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* --- Incidents --- */
+.tile.incident-alert {
+  border-color: #ff3b3b !important;
+  box-shadow: 0 0 30px rgba(255, 59, 59, 0.4);
+  animation: tile-shake 0.3s infinite;
+}
+
+@keyframes tile-shake {
+  0% { transform: translate(0, 0); }
+  25% { transform: translate(-2px, 0); }
+  50% { transform: translate(0, 0); }
+  75% { transform: translate(2px, 0); }
+  100% { transform: translate(0, 0); }
+}
+
+@keyframes blink {
+  0% { opacity: 1; }
+  50% { opacity: 0.3; }
+  100% { opacity: 1; }
+}

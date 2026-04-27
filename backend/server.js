@@ -48,6 +48,9 @@ function startMasterWorker() {
         const msg = JSON.parse(line);
         if (msg.type === 'detections') {
           io.emit('face_detections', { streamId: msg.streamId, detections: msg.detections });
+          if (msg.incidents && msg.incidents.length > 0) {
+            io.emit('incident_detections', { streamId: msg.streamId, incidents: msg.incidents });
+          }
         } else {
           console.log(`[AI] ${msg.type}: ${msg.message || line}`);
         }
