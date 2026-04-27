@@ -217,29 +217,29 @@ def stream_worker(stream_id, rtsp_url):
                     # Fallback: Color-based detection for small flames (lighters, etc.)
                     # Look for bright orange/red pixels in HSV space
                     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                    # Broad range for fire colors (Orange to Red)
-                    lower_fire = np.array([0, 100, 200], dtype="uint8")
-                    upper_fire = np.array([25, 255, 255], dtype="uint8")
+                    # Narrow range: Intense Orange/Red only
+                    lower_fire = np.array([0, 150, 200], dtype="uint8")
+                    upper_fire = np.array([15, 255, 255], dtype="uint8")
                     mask = cv2.inRange(hsv, lower_fire, upper_fire)
                     
-                    # Clean up mask
+                    # Clean up mask (Dilation to merge close sparks)
+                    mask = cv2.dilate(mask, None, iterations=2)
                     mask = cv2.GaussianBlur(mask, (5, 5), 0)
-                    _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
                     
                     # Find contours
                     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     for cnt in contours:
                         area = cv2.contourArea(cnt)
-                        if area > 100: # Min pixel area for a flame
+                        if area > 250: # Increased threshold from 100
                             x, y, w_cnt, h_cnt = cv2.boundingRect(cnt)
-                            # Normalize coordinates
-                            incidents.append({
-                                'type': 'fire', 
-                                'confidence': 0.8, 
-                                'box': [x/w, y/h, (x+w_cnt)/w, (y+h_cnt)/h]
-                            })
-                            # Only report the largest one to avoid clutter
-                            break 
+                            # Shape check: Flames are usually taller than wide or square-ish
+                            if h_cnt / w_cnt > 0.5: 
+                                incidents.append({
+                                    'type': 'fire', 
+                                    'confidence': 0.9, 
+                                    'box': [x/w, y/h, (x+w_cnt)/w, (y+h_cnt)/h]
+                                })
+                                break 
 
         except Exception as ex:
             log({'type': 'warning', 'message': f'YOLO error: {ex}'})
