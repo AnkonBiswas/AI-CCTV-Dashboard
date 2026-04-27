@@ -33,14 +33,24 @@ face_detector_options = mp_vision.FaceDetectorOptions(
 shared_face_detector = mp_vision.FaceDetector.create_from_options(face_detector_options)
 face_detector_lock = threading.Lock()
 
+def log(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+
 # YOLOv8 for General Objects & Incidents
-# Standard YOLOv8 detects 'person' (ID 0). Fire/Fight usually need custom models.
 yolo_model = YOLO(YOLO_MODEL_PATH)
+log({'type': 'info', 'message': 'YOLOv8 base model loaded'})
+
 fire_model = None
-if os.path.exists(FIRE_MODEL_PATH):
+if os.path.exists(FIRE_MODEL_PATH) and os.path.getsize(FIRE_MODEL_PATH) > 1000000:
     try:
         fire_model = YOLO(FIRE_MODEL_PATH)
-    except: pass
+        log({'type': 'info', 'message': 'Custom Fire Model loaded'})
+    except Exception as e:
+        log({'type': 'warning', 'message': f'Failed to load fire model: {e}'})
+else:
+    log({'type': 'info', 'message': 'No custom fire model found (using color-based fallback)'})
 
 yolo_lock = threading.Lock()
 
@@ -49,11 +59,6 @@ recognizer = cv2.face.LBPHFaceRecognizer_create()
 names_map = {}
 recognizer_ready = False
 recognizer_lock = threading.Lock()
-
-
-def log(obj):
-    sys.stdout.write(json.dumps(obj) + '\n')
-    sys.stdout.flush()
 
 
 def train_recognizer():
@@ -182,33 +187,24 @@ def stream_worker(stream_id, rtsp_url):
                 for box in yolo_results.boxes:
                     cls_id = int(box.cls[0])
                     conf = float(box.conf[0])
-                    if conf < 0.3: continue
+                    if conf < 0.6: continue # Increased from 0.3 to reduce false persons
                     
                     label = yolo_model.names[cls_id]
                     bx = box.xyxyn[0].tolist() # [x1, y1, x2, y2]
                     
                     if label == 'person':
+                        # Ignore very small boxes that are likely false positives (hands, etc.)
+                        bw = bx[2] - bx[0]
+                        bh = bx[3] - bx[1]
+                        if bw * bh < 0.05: continue 
+                        
                         people.append(bx)
                         detections.append({
-                            'x': bx[0], 'y': bx[1], 'w': bx[2]-bx[0], 'h': bx[3]-bx[1],
+                            'x': bx[0], 'y': bx[1], 'w': bw, 'h': bh,
                             'confidence': conf, 'label': 'person'
                         })
                     elif label in ['fire', 'smoke']: # In case custom model is used or standard detects them
                         incidents.append({'type': 'fire', 'confidence': conf, 'box': bx})
-
-                # Basic Fight Heuristic: Multiple people overlapping + high motion (simplified)
-                if len(people) >= 2:
-                    # Check for significant overlap between any two people
-                    for i in range(len(people)):
-                        for j in range(i + 1, len(people)):
-                            p1, p2 = people[i], people[j]
-                            # Intersection
-                            ix1 = max(p1[0], p2[0]); iy1 = max(p1[1], p2[1])
-                            ix2 = min(p1[2], p2[2]); iy2 = min(p1[3], p2[3])
-                            if ix2 > ix1 and iy2 > iy1:
-                                area = (ix2 - ix1) * (iy2 - iy1)
-                                if area > 0.05: # Threshold for "fighting" proximity
-                                    incidents.append({'type': 'fighting', 'confidence': 0.7, 'box': [ix1, iy1, ix2, iy2]})
 
                 # If we have a dedicated fire model, run it
                 if fire_model:
@@ -217,6 +213,33 @@ def stream_worker(stream_id, rtsp_url):
                         if float(box.conf[0]) > 0.4:
                             bx = box.xyxyn[0].tolist()
                             incidents.append({'type': 'fire', 'confidence': float(box.conf[0]), 'box': bx})
+                else:
+                    # Fallback: Color-based detection for small flames (lighters, etc.)
+                    # Look for bright orange/red pixels in HSV space
+                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                    # Broad range for fire colors (Orange to Red)
+                    lower_fire = np.array([0, 100, 200], dtype="uint8")
+                    upper_fire = np.array([25, 255, 255], dtype="uint8")
+                    mask = cv2.inRange(hsv, lower_fire, upper_fire)
+                    
+                    # Clean up mask
+                    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                    _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+                    
+                    # Find contours
+                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    for cnt in contours:
+                        area = cv2.contourArea(cnt)
+                        if area > 100: # Min pixel area for a flame
+                            x, y, w_cnt, h_cnt = cv2.boundingRect(cnt)
+                            # Normalize coordinates
+                            incidents.append({
+                                'type': 'fire', 
+                                'confidence': 0.8, 
+                                'box': [x/w, y/h, (x+w_cnt)/w, (y+h_cnt)/h]
+                            })
+                            # Only report the largest one to avoid clutter
+                            break 
 
         except Exception as ex:
             log({'type': 'warning', 'message': f'YOLO error: {ex}'})
