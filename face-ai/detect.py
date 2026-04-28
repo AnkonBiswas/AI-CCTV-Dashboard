@@ -10,7 +10,7 @@ FACE_MODEL_PATH = os.path.join(HERE, 'blaze_face_short_range.tflite')
 YOLO_MODEL_PATH = os.path.join(HERE, 'yolov8n.pt') # Standard nano model
 FIRE_MODEL_PATH = os.path.join(HERE, 'fire_model.pt') # Optional custom model
 
-FRAME_SKIP = 2               # process every Nth frame per stream
+FRAME_SKIP = 5               # Process every 5th frame to reduce CPU load
 RECOGNITION_THRESHOLD = 115
 
 # ── Download models if needed ──────────────────────────────────
@@ -124,6 +124,7 @@ def stream_worker(stream_id, rtsp_url):
         if cap is None or not cap.isOpened():
             if cap: cap.release()
             cap = cv2.VideoCapture(rtsp_url)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Reduce lag by minimizing buffer
             if not cap.isOpened():
                 time.sleep(2); continue
 
@@ -134,6 +135,12 @@ def stream_worker(stream_id, rtsp_url):
         frame_idx += 1
         if frame_idx % FRAME_SKIP != 0: continue
 
+        # Downscale for performance (significant CPU saving)
+        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+        h, w = small_frame.shape[:2]
+        rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
         # Auto-retrain
         if os.path.isdir(ENROLLMENT_DIR):
             try:
@@ -143,17 +150,13 @@ def stream_worker(stream_id, rtsp_url):
                     train_recognizer()
             except: pass
 
-        h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
         # 1. Face Detection & Recognition
         detections = []
         try:
             with face_detector_lock:
                 result = shared_face_detector.detect(mp_img)
             if result.detections:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
                 for d in result.detections:
                     bb = d.bounding_box
                     name = None
@@ -180,8 +183,8 @@ def stream_worker(stream_id, rtsp_url):
         incidents = []
         try:
             with yolo_lock:
-                # Run YOLOv8 on current frame
-                yolo_results = yolo_model(frame, verbose=False)[0]
+                # Run YOLOv8 on small frame
+                yolo_results = yolo_model(small_frame, verbose=False)[0]
                 
                 people = []
                 for box in yolo_results.boxes:
@@ -216,7 +219,7 @@ def stream_worker(stream_id, rtsp_url):
                 else:
                     # Fallback: Color-based detection for small flames (lighters, etc.)
                     # Look for bright orange/red pixels in HSV space
-                    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                    hsv = cv2.cvtColor(small_frame, cv2.COLOR_BGR2HSV)
                     # Narrow range: Intense Orange/Red only
                     lower_fire = np.array([0, 150, 200], dtype="uint8")
                     upper_fire = np.array([15, 255, 255], dtype="uint8")

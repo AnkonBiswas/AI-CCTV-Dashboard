@@ -3,20 +3,26 @@ const socket = io(API);
 const grid = document.getElementById('grid');
 const cameras = new Map();
 
+const DETECTION_SYNC_DELAY = 1200; // ms to wait for HLS buffer to catch up
+
 socket.on('face_detections', ({ streamId, detections }) => {
-  const cam = cameras.get(streamId);
-  if (!cam) return;
-  cam.lastDetections = detections;
-  cam.lastUpdate = Date.now();
-  drawDetections(cam);
+  setTimeout(() => {
+    const cam = cameras.get(streamId);
+    if (!cam) return;
+    cam.lastDetections = detections;
+    cam.lastUpdate = Date.now();
+    drawDetections(cam);
+  }, DETECTION_SYNC_DELAY);
 });
 
 socket.on('incident_detections', ({ streamId, incidents }) => {
-  const cam = cameras.get(streamId);
-  if (!cam) return;
-  cam.lastIncidents = incidents;
-  cam.lastIncidentUpdate = Date.now();
-  drawDetections(cam);
+  setTimeout(() => {
+    const cam = cameras.get(streamId);
+    if (!cam) return;
+    cam.lastIncidents = incidents;
+    cam.lastIncidentUpdate = Date.now();
+    drawDetections(cam);
+  }, DETECTION_SYNC_DELAY);
 });
 
 function makeTile(streamId, cameraName, hlsUrl) {
@@ -53,13 +59,14 @@ function makeTile(streamId, cameraName, hlsUrl) {
     const hls = new Hls({
       lowLatencyMode: true,
       enableWorker: true,
-      backBufferLength: 8,
-      maxBufferLength: 8,
-      maxMaxBufferLength: 15,
-      liveSyncDuration: 2,
-      liveMaxLatencyDuration: 6,
+      backBufferLength: 0,
+      maxBufferLength: 4,
+      maxMaxBufferLength: 8,
+      liveSyncDuration: 0.5,
+      liveMaxLatencyDuration: 2,
       liveDurationInfinity: true,
-      maxLiveSyncPlaybackRate: 1.5,
+      maxLiveSyncPlaybackRate: 2.0,
+      manifestLoadingMaxRetry: 10,
     });
     hls.loadSource(src);
     hls.attachMedia(video);
