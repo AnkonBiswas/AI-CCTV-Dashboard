@@ -13,6 +13,10 @@ FIRE_MODEL_PATH = os.path.join(HERE, 'fire_model.pt') # Optional custom model
 FRAME_SKIP = 5               # Process every 5th frame to reduce CPU load
 RECOGNITION_THRESHOLD = 115
 
+def log(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
 # ── Download models if needed ──────────────────────────────────
 if not os.path.exists(FACE_MODEL_PATH):
     import urllib.request
@@ -32,10 +36,6 @@ face_detector_options = mp_vision.FaceDetectorOptions(
 )
 shared_face_detector = mp_vision.FaceDetector.create_from_options(face_detector_options)
 face_detector_lock = threading.Lock()
-
-def log(obj):
-    sys.stdout.write(json.dumps(obj) + '\n')
-    sys.stdout.flush()
 
 
 # YOLOv8 for General Objects & Incidents
