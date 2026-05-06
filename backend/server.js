@@ -14,6 +14,7 @@ const HLS_BASE = 'http://127.0.0.1:8888';
 const PYTHON = process.env.PYTHON || 'python';
 const DETECTOR = path.join(__dirname, '..', 'face-ai', 'detect.py');
 const ENROLLMENT_DIR = path.join(__dirname, '..', 'face-ai', 'enrollments');
+const AGENT_SCRIPT = path.join(__dirname, '..', 'agent', 'agent.py');
 
 fs.mkdirSync(ENROLLMENT_DIR, { recursive: true });
 
@@ -25,6 +26,7 @@ const server = createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 const activeStreams = new Map();
+const activeAgents = new Map();
 
 // ── Single shared AI worker process ──────────────────────────
 let masterWorker = null;
@@ -120,12 +122,39 @@ app.post('/add-camera', async (req, res) => {
   // Tell the AI worker to start reading from MediaMTX's local loopback
   sendWorkerCmd({ cmd: 'add', streamId, rtspUrl: localRtspUrl });
 
+  // ── AUTOMATIC AGENT: We spawn the agent.py process locally
+  // This streamlines the setup for local cameras.
+  const backendUrl = `http://127.0.0.1:${PORT}`;
+  console.log(`[Backend] Auto-starting agent for: ${cameraName}`);
+  const agentProc = spawn(PYTHON, [AGENT_SCRIPT, backendUrl, pathName, rtspUrl]);
+
+  agentProc.stdout.on('data', (d) => {
+    const txt = d.toString().trim();
+    if (txt) {
+      console.log(`[Agent ${pathName}] ${txt}`);
+      if (txt.includes('[Agent]')) {
+        io.emit('agent_status', { streamId, message: txt });
+      }
+    }
+  });
+
+  agentProc.stderr.on('data', (d) => {
+    console.error(`[Agent ${pathName} Error] ${d.toString()}`);
+  });
+
+  agentProc.on('error', (err) => {
+    console.error(`[Backend] Failed to start agent for ${cameraName}:`, err);
+  });
+
+  activeAgents.set(streamId, agentProc);
+
   res.json({
     streamId,
     cameraName,
     hlsUrl,
-    streamKey: pathName,   // The agent needs this to push to MediaMTX
+    streamKey: pathName,   // Still return this for manual fallback
     rtspUrl,               // Original URL echoed back for display
+    agentStarted: true     // New flag
   });
 });
 
@@ -142,6 +171,13 @@ app.delete('/camera/:id', async (req, res) => {
   if (!stream) return res.status(404).json({ error: 'stream not found' });
 
   sendWorkerCmd({ cmd: 'remove', streamId: id });
+
+  const agentProc = activeAgents.get(id);
+  if (agentProc) {
+    console.log(`[Backend] Stopping agent for camera ${id}`);
+    agentProc.kill();
+    activeAgents.delete(id);
+  }
 
   try {
     await axios.post(`${MEDIAMTX_API}/v3/config/paths/remove/${stream.pathName}`);
@@ -241,6 +277,9 @@ app.get('/enrollment/:name/image', (req, res) => {
 // ── Shutdown ──────────────────────────────────────────────────
 process.on('SIGINT', () => {
   sendWorkerCmd({ cmd: 'quit' });
+  for (const agent of activeAgents.values()) {
+    agent.kill();
+  }
   setTimeout(() => {
     if (masterWorker) masterWorker.kill();
     process.exit(0);

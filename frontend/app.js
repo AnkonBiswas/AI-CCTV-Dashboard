@@ -28,6 +28,22 @@ socket.on('incident_detections', ({ streamId, incidents }) => {
   }, DETECTION_SYNC_DELAY);
 });
 
+socket.on('agent_status', ({ streamId, message }) => {
+  console.log(`[Agent Status] ${streamId}: ${message}`);
+  const modal = document.getElementById('agent-modal');
+  if (modal && modal.style.display === 'flex') {
+    const desc = modal.querySelector('.modal-desc');
+    if (desc) {
+      desc.innerHTML = `<span style="color: #00f2ff">⚡ STATUS: ${message}</span>`;
+      if (message.includes('Successfully installed')) {
+        setTimeout(() => {
+          desc.innerHTML = `FFmpeg has been configured automatically. The stream should appear shortly.`;
+        }, 2000);
+      }
+    }
+  }
+});
+
 function makeTile(streamId, cameraName, rawHlsUrl) {
   // If we are on a remote server, we need to point to that server's port 8888, not localhost/127.0.0.1
   let hlsUrl = rawHlsUrl;
@@ -232,9 +248,9 @@ async function addCamera({ cameraName, rtspUrl }) {
     alert(`Add camera failed: ${await resp.text()}`);
     return;
   }
-  const { streamId, hlsUrl, streamKey } = await resp.json();
+  const { streamId, hlsUrl, streamKey, agentStarted } = await resp.json();
   makeTile(streamId, cameraName, hlsUrl);
-  showAgentModal(streamKey, rtspUrl);
+  showAgentModal(streamKey, rtspUrl, agentStarted);
 }
 
 async function removeCamera(streamId) {
@@ -320,7 +336,7 @@ refreshEnrollments();
 refreshCameras();
 
 // ── Agent Modal ───────────────────────────────────────────────
-function showAgentModal(streamKey, rtspUrl) {
+function showAgentModal(streamKey, rtspUrl, agentStarted = false) {
   const serverUrl = API;
   const isWindows = navigator.userAgent.includes('Win');
   const ffmpegInstall = isWindows
@@ -328,6 +344,21 @@ function showAgentModal(streamKey, rtspUrl) {
     : 'sudo apt install ffmpeg   # Debian/Ubuntu\n# brew install ffmpeg          # macOS';
 
   const agentCmd = `python agent/agent.py ${serverUrl} ${streamKey} ${rtspUrl}`;
+
+  const modalTitle = document.querySelector('#agent-modal h2');
+  if (modalTitle) {
+    modalTitle.textContent = agentStarted 
+      ? '✓ Local Agent Started Automatically' 
+      : 'Connect Camera Agent';
+    modalTitle.style.color = agentStarted ? '#00ff88' : '';
+  }
+
+  const modalDesc = document.querySelector('#agent-modal .modal-desc');
+  if (modalDesc) {
+    modalDesc.innerHTML = agentStarted
+      ? `The system has automatically started a local FFmpeg bridge for this camera. <b>You don't need to do anything</b>, but here is the manual command if you need to run it on a different machine:`
+      : `To connect your local RTSP camera to the dashboard, you need to run the bridge agent. Follow these steps:`;
+  }
 
   document.getElementById('ffmpeg-cmd').textContent = ffmpegInstall;
   document.getElementById('agent-cmd').textContent = agentCmd;

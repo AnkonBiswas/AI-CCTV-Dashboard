@@ -31,6 +31,8 @@ import os
 import urllib.request
 import json
 import re
+import zipfile
+import shutil
 
 def get_server_host(server_url):
     """Extracts just the hostname/IP from a full URL like http://1.2.3.4:3000"""
@@ -48,10 +50,83 @@ def check_server(server_url, stream_key):
         print(f"[Agent] Server check failed: {e}")
         return False
 
-def run_ffmpeg(local_rtsp, push_url):
+def get_ffmpeg_command():
+    """Finds the ffmpeg executable, checking local and system paths."""
+    # 1. Check system PATH
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        return 'ffmpeg'
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+    # 2. Check local directory and parent (root)
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    for p in [os.path.join(here, 'ffmpeg.exe'), os.path.join(root, 'ffmpeg.exe')]:
+        if os.path.exists(p):
+            return p
+
+    return None
+
+def download_ffmpeg():
+    """Downloads a portable ffmpeg.exe for Windows if missing."""
+    if os.name != 'nt':
+        return False
+    
+    url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+    here = os.path.dirname(os.path.abspath(__file__))
+    target = os.path.join(here, "ffmpeg.exe")
+    zip_path = os.path.join(here, "ffmpeg.zip")
+
+    print("[Agent] FFmpeg missing. Attempting automatic download for Windows...")
+    try:
+        print(f"[Agent] Downloading from {url}...")
+        with urllib.request.urlopen(url) as response, open(zip_path, 'wb') as out_file:
+            shutil.copyfileobj(response, out_file)
+        
+        print("[Agent] Extracting ffmpeg.exe...")
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            # Find the bin/ffmpeg.exe inside the nested folder in the zip
+            exe_member = next((m for m in z.namelist() if m.endswith('bin/ffmpeg.exe')), None)
+            if exe_member:
+                with z.open(exe_member) as source, open(target, 'wb') as dest:
+                    shutil.copyfileobj(source, dest)
+                print(f"[Agent] Successfully installed to {target}")
+                return target
+    except Exception as e:
+        print(f"[Agent] Auto-download failed: {e}")
+    finally:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+    return None
+
+def check_ffmpeg():
+    """Verify FFmpeg is installed and accessible, or try to auto-setup."""
+    cmd = get_ffmpeg_command()
+    if cmd:
+        return cmd
+    
+    # Try auto-download
+    cmd = download_ffmpeg()
+    if cmd:
+        return cmd
+    
+    print("=" * 60)
+    print("ERROR: FFmpeg not found!")
+    print("=" * 60)
+    print("Install FFmpeg and make sure it is in your PATH:\n")
+    print("  Windows : winget install -e --id Gyan.FFmpeg")
+    print("            OR download from https://ffmpeg.org/download.html")
+    print("  Ubuntu  : sudo apt install ffmpeg")
+    print("  macOS   : brew install ffmpeg")
+    print("\nAfter installing, close and reopen your terminal, then try again.")
+    print("=" * 60)
+    return None
+
+def run_ffmpeg(ffmpeg_cmd, local_rtsp, push_url):
     """Start FFmpeg to bridge local RTSP → remote MediaMTX."""
     cmd = [
-        'ffmpeg',
+        ffmpeg_cmd,
         '-loglevel', 'warning',
         '-rtsp_transport', 'tcp',
         '-i', local_rtsp,
@@ -77,11 +152,20 @@ def main():
     server_host = get_server_host(server_url)
     push_url = f"rtsp://{server_host}:8554/{stream_key}"
 
+    ffmpeg_cmd = check_ffmpeg()
+    if not ffmpeg_cmd:
+        sys.exit(1)
+
     print(f"[Agent] AI-CCTV Local Agent starting...")
     print(f"[Agent] Server   : {server_url}")
     print(f"[Agent] Push URL : {push_url}")
     print(f"[Agent] Source   : {local_rtsp}")
-    print()
+
+    # Wait for server registration
+    print(f"[Agent] Waiting for stream registration...")
+    while not check_server(server_url, stream_key):
+        time.sleep(1)
+    print(f"[Agent] Stream registered. Connecting FFmpeg...")
 
     running = True
 
@@ -96,7 +180,7 @@ def main():
     retry_delay = 5
 
     while running:
-        proc = run_ffmpeg(local_rtsp, push_url)
+        proc = run_ffmpeg(ffmpeg_cmd, local_rtsp, push_url)
 
         for line in proc.stdout:
             txt = line.rstrip()
