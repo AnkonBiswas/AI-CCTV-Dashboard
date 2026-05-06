@@ -232,8 +232,9 @@ async function addCamera({ cameraName, rtspUrl }) {
     alert(`Add camera failed: ${await resp.text()}`);
     return;
   }
-  const { streamId, hlsUrl } = await resp.json();
+  const { streamId, hlsUrl, streamKey } = await resp.json();
   makeTile(streamId, cameraName, hlsUrl);
+  showAgentModal(streamKey, rtspUrl);
 }
 
 async function removeCamera(streamId) {
@@ -317,3 +318,38 @@ async function refreshCameras() {
 
 refreshEnrollments();
 refreshCameras();
+
+// ── Agent Modal ───────────────────────────────────────────────
+function showAgentModal(streamKey, rtspUrl) {
+  const serverUrl = API;
+  const isWindows = navigator.userAgent.includes('Win');
+  const ffmpegInstall = isWindows
+    ? 'winget install ffmpeg  (or download from https://ffmpeg.org/download.html)'
+    : 'sudo apt install ffmpeg   # Debian/Ubuntu\n# brew install ffmpeg          # macOS';
+
+  const agentCmd = `python agent/agent.py ${serverUrl} ${streamKey} ${rtspUrl}`;
+
+  document.getElementById('ffmpeg-cmd').textContent = ffmpegInstall;
+  document.getElementById('agent-cmd').textContent = agentCmd;
+  document.getElementById('agent-modal').style.display = 'flex';
+}
+
+function closeAgentModal() {
+  document.getElementById('agent-modal').style.display = 'none';
+}
+
+document.getElementById('modal-close-btn').addEventListener('click', closeAgentModal);
+document.getElementById('modal-done-btn').addEventListener('click', closeAgentModal);
+document.getElementById('agent-modal').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeAgentModal();
+});
+
+document.querySelectorAll('.copy-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const target = document.getElementById(btn.dataset.target);
+    navigator.clipboard.writeText(target.textContent).then(() => {
+      btn.textContent = 'Copied!';
+      setTimeout(() => btn.textContent = 'Copy', 1500);
+    });
+  });
+});

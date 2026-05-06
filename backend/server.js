@@ -97,33 +97,43 @@ app.post('/add-camera', async (req, res) => {
   }
 
   const streamId = uuidv4();
-  const pathName = `camera_${streamId.replace(/-/g, '_')}`; // Use underscores instead of hyphens for MediaMTX compatibility
+  const pathName = `camera_${streamId.replace(/-/g, '_')}`;
 
+  // ── PUSH MODE: MediaMTX waits for the local agent to push the stream.
+  // We register the path with no source so it acts as a publisher endpoint.
   try {
-    await axios.post(`${MEDIAMTX_API}/v3/config/paths/add/${pathName}`, {
-      source: rtspUrl,
-      sourceOnDemand: false,
-      rtspTransport: 'tcp',
-    });
+    await axios.post(`${MEDIAMTX_API}/v3/config/paths/add/${pathName}`, {});
   } catch (err) {
     console.error('[Backend] MediaMTX Error:', err.response?.data || err.message);
     const detail = err.response?.data || err.message;
-    return res.status(502).json({ 
+    return res.status(502).json({
       error: `MediaMTX add path failed: ${JSON.stringify(detail)}`,
       detail: detail
     });
   }
 
   const hlsUrl = `${HLS_BASE}/${pathName}/`;
-  // Use MediaMTX's local re-stream so the phone only receives ONE connection.
-  // MediaMTX → Python is local loopback; Phone → MediaMTX is the only external link.
-  const localRtspUrl = `rtsp://localhost:8554/${pathName}`;
+  // AI worker reads from MediaMTX's local RTSP re-stream (after agent pushes to it)
+  const localRtspUrl = `rtsp://127.0.0.1:8554/${pathName}`;
   activeStreams.set(streamId, { cameraName, rtspUrl, pathName, hlsUrl });
 
-  // Tell the single worker to process via local MediaMTX RTSP (not the phone directly)
+  // Tell the AI worker to start reading from MediaMTX's local loopback
   sendWorkerCmd({ cmd: 'add', streamId, rtspUrl: localRtspUrl });
 
-  res.json({ streamId, cameraName, hlsUrl });
+  res.json({
+    streamId,
+    cameraName,
+    hlsUrl,
+    streamKey: pathName,   // The agent needs this to push to MediaMTX
+    rtspUrl,               // Original URL echoed back for display
+  });
+});
+
+// ── Stream key verification (used by agent.py to confirm registration) ─
+app.get('/streams/:key', (req, res) => {
+  const found = [...activeStreams.values()].some(s => s.pathName === req.params.key);
+  if (found) return res.json({ ok: true });
+  res.status(404).json({ ok: false });
 });
 
 app.delete('/camera/:id', async (req, res) => {
@@ -131,7 +141,6 @@ app.delete('/camera/:id', async (req, res) => {
   const stream = activeStreams.get(id);
   if (!stream) return res.status(404).json({ error: 'stream not found' });
 
-  // Tell worker to stop this stream's thread
   sendWorkerCmd({ cmd: 'remove', streamId: id });
 
   try {

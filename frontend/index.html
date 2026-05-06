@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8">
   <title>CCTV Dashboard</title>
@@ -10,6 +11,7 @@
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
   <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
 </head>
+
 <body>
   <header>
     <h1>CCTV Dashboard</h1>
@@ -23,7 +25,7 @@
           <input name="cameraName" placeholder="Camera identification" required>
         </div>
         <div class="input-group">
-          <input name="rtspUrl" placeholder="rtsp://address:port/path" required>
+          <input name="rtspUrl" placeholder="rtsp://192.168.x.x:port/path (local)" required>
         </div>
         <button type="submit" class="btn-primary">Add Stream</button>
       </form>
@@ -46,6 +48,48 @@
 
   <main id="grid"></main>
 
+  <!-- Agent Instructions Modal -->
+  <div id="agent-modal" class="modal-overlay" style="display:none">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span class="modal-icon">🖥️</span>
+        <h2>Run Local Agent</h2>
+        <button class="modal-close" id="modal-close-btn">✕</button>
+      </div>
+      <p class="modal-desc">
+        Your camera is registered. Since it's on a local network, you need to run
+        <strong>agent.py</strong> on any machine that can reach it. This agent
+        pulls the RTSP stream and pushes it securely to the server.
+      </p>
+
+      <div class="modal-step">
+        <span class="step-num">1</span>
+        <span>Install <strong>FFmpeg</strong> if not already installed</span>
+      </div>
+      <div class="code-block">
+        <code id="ffmpeg-cmd"></code>
+        <button class="copy-btn" data-target="ffmpeg-cmd">Copy</button>
+      </div>
+
+      <div class="modal-step">
+        <span class="step-num">2</span>
+        <span>Run <strong>agent.py</strong> from the repo</span>
+      </div>
+      <div class="code-block">
+        <code id="agent-cmd"></code>
+        <button class="copy-btn" data-target="agent-cmd">Copy</button>
+      </div>
+
+      <p class="modal-note">
+        ⚡ The stream will appear in the dashboard automatically once the agent connects.
+        Keep agent.py running while the camera is in use.
+      </p>
+      <button class="btn-primary" id="modal-done-btn" style="width:100%;margin-top:8px">Got it — I'll run the
+        agent</button>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
+
 </html>
