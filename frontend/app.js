@@ -1,4 +1,7 @@
-const API = 'http://localhost:3000';
+const API = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://localhost:3000'
+  : `${window.location.protocol}//${window.location.hostname}:3000`;
+
 const socket = io(API);
 const grid = document.getElementById('grid');
 const cameras = new Map();
@@ -25,7 +28,12 @@ socket.on('incident_detections', ({ streamId, incidents }) => {
   }, DETECTION_SYNC_DELAY);
 });
 
-function makeTile(streamId, cameraName, hlsUrl) {
+function makeTile(streamId, cameraName, rawHlsUrl) {
+  // If we are on a remote server, we need to point to that server's port 8888, not localhost
+  const hlsUrl = (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1')
+    ? rawHlsUrl.replace('localhost', window.location.hostname)
+    : rawHlsUrl;
+
   const tile = document.createElement('div');
   tile.className = 'tile';
   tile.innerHTML = `
