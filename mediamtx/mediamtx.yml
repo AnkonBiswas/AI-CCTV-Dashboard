@@ -1,26 +1,10 @@
-# MediaMTX Configuration
+# MediaMTX Configuration (compatible with v1.9.x)
 logLevel: info
-logDestinations: [stdout]
 
 # API for programmatic control
 api: yes
 apiAddress: :9997
 
-# ── RTSP Server ────────────────────────────────────────────────
-rtsp: yes
-rtspAddress: :8554
-rtspTransports: [tcp]
-
 # ── HLS Settings ───────────────────────────────────────────────
 hls: yes
 hlsAddress: :8888
-hlsAlwaysRemux: yes
-hlsAllowOrigins: ["*"]
-
-pathDefaults:
-  rtspTransport: tcp
-  sourceOnDemand: no
-
-paths:
-  all:
-    source: publisher
