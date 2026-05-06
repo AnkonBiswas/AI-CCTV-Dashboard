@@ -29,10 +29,11 @@ socket.on('incident_detections', ({ streamId, incidents }) => {
 });
 
 function makeTile(streamId, cameraName, rawHlsUrl) {
-  // If we are on a remote server, we need to point to that server's port 8888, not localhost
-  const hlsUrl = (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1')
-    ? rawHlsUrl.replace('localhost', window.location.hostname)
-    : rawHlsUrl;
+  // If we are on a remote server, we need to point to that server's port 8888, not localhost/127.0.0.1
+  let hlsUrl = rawHlsUrl;
+  if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    hlsUrl = hlsUrl.replace('localhost', window.location.hostname).replace('127.0.0.1', window.location.hostname);
+  }
 
   const tile = document.createElement('div');
   tile.className = 'tile';

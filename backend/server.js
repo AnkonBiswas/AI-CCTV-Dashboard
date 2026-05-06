@@ -9,8 +9,8 @@ const path = require('path');
 const fs = require('fs');
 
 const PORT = 3000;
-const MEDIAMTX_API = 'http://localhost:9997';
-const HLS_BASE = 'http://localhost:8888';
+const MEDIAMTX_API = 'http://127.0.0.1:9997';
+const HLS_BASE = 'http://127.0.0.1:8888';
 const PYTHON = process.env.PYTHON || 'python';
 const DETECTOR = path.join(__dirname, '..', 'face-ai', 'detect.py');
 const ENROLLMENT_DIR = path.join(__dirname, '..', 'face-ai', 'enrollments');
@@ -97,7 +97,7 @@ app.post('/add-camera', async (req, res) => {
   }
 
   const streamId = uuidv4();
-  const pathName = `camera_${streamId}`;
+  const pathName = `camera_${streamId.replace(/-/g, '_')}`; // Use underscores instead of hyphens for MediaMTX compatibility
 
   try {
     await axios.post(`${MEDIAMTX_API}/v3/config/paths/add/${pathName}`, {
@@ -106,8 +106,12 @@ app.post('/add-camera', async (req, res) => {
       rtspTransport: 'tcp',
     });
   } catch (err) {
+    console.error('[Backend] MediaMTX Error:', err.response?.data || err.message);
     const detail = err.response?.data || err.message;
-    return res.status(502).json({ error: `MediaMTX add path failed: ${JSON.stringify(detail)}` });
+    return res.status(502).json({ 
+      error: `MediaMTX add path failed: ${JSON.stringify(detail)}`,
+      detail: detail
+    });
   }
 
   const hlsUrl = `${HLS_BASE}/${pathName}/`;
