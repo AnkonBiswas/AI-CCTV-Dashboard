@@ -4,50 +4,91 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Three-process RTSP camera dashboard with live person-detection overlays and optional face-recognition by name. A browser UI calls a Node backend, which (a) registers RTSP sources with a local MediaMTX server that transcodes them to HLS and (b) spawns a Python YOLO worker per stream that posts detection boxes back through Socket.IO.
+Multi-camera RTSP dashboard with live person/face detection, name recognition, and fire/incident overlays. Four cooperating processes:
+
+1. **MediaMTX** — RTSP ingest + HLS re-publishing.
+2. **Backend** (Node/Express + Socket.IO) — registers MediaMTX paths, spawns the local push agent and the shared AI worker, fans out detections to browsers.
+3. **Local agent** (`agent/agent.py`) — FFmpeg bridge that pulls from a camera's RTSP URL and pushes to MediaMTX's `:8554` ingest. Auto-spawned by the backend for local cameras; can also be run manually on a remote LAN.
+4. **Master AI worker** (`face-ai/detect.py`) — a single Python process running MediaPipe face detection, LBPH name recognition, YOLOv8 object detection, and a fire detector across all streams.
 
 ## Running the stack
 
-`start.bat` from the repo root launches all three processes in separate windows. Manual equivalents:
+`start.bat` from the repo root launches MediaMTX, backend, and frontend in separate minimized windows. **It first kills any existing `node.exe`, `python.exe`, and `mediamtx.exe`** to avoid port conflicts — be aware if you have unrelated Python/Node processes running.
 
-- **MediaMTX** — `cd mediamtx && ./mediamtx.exe` (must start first; backend POSTs to its API on boot of each camera).
-- **Backend** — `cd backend && npm start` (or `npm run dev` for nodemon). Listens on `:3000`.
+Manual equivalents:
+
+- **MediaMTX** — `cd mediamtx && ./mediamtx.exe` (must start first; backend POSTs to its API at boot of each camera).
+- **Backend** — `cd backend && npm start` (or `npm run dev` for nodemon). Listens on `:3000`. Spawns the master AI worker on startup.
 - **Frontend** — `cd frontend && python -m http.server 8080`. Static files only; no build step.
 
-Python deps for the AI worker (`face-ai/detect.py`): `ultralytics`, `opencv-python`, and optionally `face_recognition` (for name matching; worker runs without it but skips identification). The worker tries `yolov8n-face.pt` first and falls back to `yolov8n.pt`; if neither file is present, ultralytics auto-downloads `yolov8n.pt` from its hub on first run. When the COCO model is used, only class 0 (`person`) is emitted.
+Python deps for the AI worker: `ultralytics`, `opencv-python` (with `opencv-contrib-python` for `cv2.face.LBPHFaceRecognizer_create`), `mediapipe`, `numpy`. The agent (`agent/agent.py`) needs FFmpeg on PATH; on Windows it auto-downloads a portable `ffmpeg.exe` into `agent/` if missing.
 
-There is no test suite (`npm test` is a stub). `TESTING.md` is a manual verification checklist with public RTSP URLs for smoke testing.
+`PYTHON` env var overrides the interpreter the backend spawns for both `detect.py` and `agent.py` (defaults to `python`).
+
+There is no test suite (`npm test` is a stub). `TESTING.md` is currently empty.
 
 ## Architecture
 
-### Data flow for a single camera
+### Data flow for one camera
 
-1. User posts `{ rtspUrl, cameraName }` to `POST /add-camera` ([backend/server.js:76](backend/server.js#L76)).
-2. Backend generates a `streamId` (UUID) and a MediaMTX `pathName = camera_<streamId>`, then calls `POST http://localhost:9997/v3/config/paths/add/<pathName>` with `sourceOnDemand: false` and `rtspTransport: tcp`. **`sourceOnDemand` is deliberately false so the AI worker always has a stream to pull** — changing it will break detection when no browser is watching.
-3. Backend spawns `python face-ai/detect.py <rtspUrl> <streamId>` ([backend/server.js:31](backend/server.js#L31)). The worker talks directly to the original RTSP source, not through MediaMTX.
-4. Backend returns `hlsUrl = http://localhost:8888/<pathName>/`; the frontend appends `index.m3u8` and plays it with hls.js ([frontend/app.js:115](frontend/app.js#L115)).
-5. The Python worker prints one JSON envelope per processed frame to stdout (`{type: "detections", streamId, detections: [...]}`); the backend parses each line and broadcasts `face_detections` over Socket.IO. The event name is kept as `face_detections` even though the payload is now persons/faces — renaming it would break all listeners. The frontend draws boxes onto a `<canvas>` overlaid on the `<video>`. Non-`detections` envelopes (`warning`, `error`) are logged server-side, not forwarded.
+1. Browser POSTs `{ rtspUrl, cameraName }` to `POST /add-camera` ([backend/server.js:95](backend/server.js#L95)).
+2. Backend mints `streamId` (UUID) and `pathName = camera_<streamId-with-underscores>`, then calls `POST http://127.0.0.1:9997/v3/config/paths/add/<pathName>` with an empty body — registering a publisher path with no `source`. **Paths are publisher endpoints, not pull sources.** Anything that pushes to `rtsp://127.0.0.1:8554/<pathName>` becomes the stream.
+3. Backend tells the master AI worker over stdin: `{cmd:"add", streamId, rtspUrl: "rtsp://127.0.0.1:8554/<pathName>"}` ([backend/server.js:123](backend/server.js#L123)). **The worker reads MediaMTX's loopback re-stream, not the original camera URL.** This is what gives the worker low-latency, TCP-stable input even when the camera is across a flaky LAN.
+4. Backend spawns `python agent/agent.py http://127.0.0.1:3000 <pathName> <rtspUrl>` ([backend/server.js:129](backend/server.js#L129)). The agent polls `GET /streams/<pathName>`, then runs `ffmpeg -rtsp_transport tcp -i <rtspUrl> -c copy -f rtsp <push-url>` to bridge into MediaMTX. It auto-reconnects with a 5s backoff.
+5. Backend returns `hlsUrl = http://127.0.0.1:8888/<pathName>/`. Frontend appends `index.m3u8` and plays it via hls.js.
+6. Master worker emits one JSON line per processed frame on stdout: `{type:"detections", streamId, detections:[…], incidents:[…]}`. Backend parses each line and forwards via Socket.IO as **two separate events**: `face_detections` (persons + faces) and `incident_detections` (only when `incidents` is non-empty). Non-`detections` envelopes (`info`, `warning`, `error`, `ready`) are logged server-side, not forwarded. The event name `face_detections` is kept even though the payload now mixes persons and faces — renaming would break the frontend listener.
+
+### Single shared AI worker
+
+[backend/server.js:35](backend/server.js#L35) spawns ONE `detect.py` process at startup and pipes commands over stdin. The worker spawns one thread per `streamId` ([face-ai/detect.py:113](face-ai/detect.py#L113)) — adding a camera does not fork a new process. The stdin command protocol is `{cmd:"add"|"remove"|"quit", streamId, rtspUrl?}`.
+
+If the worker exits, the backend re-spawns it after 3s and replays `add` commands for every entry in `activeStreams` ([backend/server.js:73](backend/server.js#L73)). Don't add per-process state in `detect.py` that can't survive an `add` replay.
+
+Models share locks to stay thread-safe across stream threads: `face_detector_lock`, `yolo_lock`, `recognizer_lock`. If you add a model, give it its own lock — don't reuse an existing one.
+
+### Per-stream state on the backend
+
+Two Maps keyed by `streamId`:
+- `activeStreams` — camera metadata (`cameraName`, `rtspUrl`, `pathName`, `hlsUrl`).
+- `activeAgents` — child process handles for the auto-spawned `agent.py` instances.
+
+Both are **in-memory only**. Restarting the backend drops both maps but the agents and MediaMTX paths persist as orphans until manually killed (or until `start.bat` blows them away). `DELETE /camera/:id` must do all four: `sendWorkerCmd({cmd:"remove"})`, `agentProc.kill()`, `POST /v3/config/paths/remove/<pathName>` to MediaMTX, and `activeStreams.delete()`. Skipping any one leaks resources.
 
 ### Coordinate contract between worker and frontend
 
-Each detection is `{x, y, w, h, confidence, label, name}` where `x/y/w/h` are **relative** (0..1 of the source frame), `label` is `"person"` or `"face"` depending on which YOLO weights loaded, and `name` is the matched enrollment name or `null`. The frontend multiplies the relative coords by `canvas.width/height`, which is sized to the rendered `<video>`. If you change one side of this contract you must change the other — do not switch to absolute pixels on just one side.
+Each detection is `{x, y, w, h, confidence, label, name?}` where `x/y/w/h` are **relative (0..1)** of the (downscaled) source frame. `label` is `"person"` (from YOLO) or `"face"` (from MediaPipe). `name` is the LBPH-matched enrollment name or `null`. Incidents are `{type:"fire", confidence, box:[x1,y1,x2,y2]}` — note `box` is **two corners**, not `xywh`. Frontend multiplies by `canvas.width/height` ([frontend/app.js:177](frontend/app.js#L177)). If you change one side of this contract, change the other.
 
-### Per-stream state
+### Frame throttling and downscale
 
-Two parallel Maps keyed by `streamId`: `activeStreams` (camera metadata) and `aiProcesses` (child process handles). Both are **in-memory only** — restarting the backend drops all cameras, but MediaMTX keeps the paths it was told to add, so a restart can leave orphaned paths in `mediamtx` that the backend no longer knows about.
+`FRAME_SKIP = 5` ([face-ai/detect.py:13](face-ai/detect.py#L13)) — every 5th frame is processed. Each processed frame is then downscaled to 0.5× before face detection and YOLO. The fire model (when loaded) runs on the *full-size* frame. The browser canvas auto-clears 1s after the last detection event, so if you slow the worker further, boxes will flicker.
 
-Removing a camera (`DELETE /camera/:id`) must both `process.kill()` the Python worker and call MediaMTX's `config/paths/remove` — skipping either leaks resources.
+### Models and where they come from
 
-### Frame throttling
+- **MediaPipe face detector** — `face-ai/blaze_face_short_range.tflite`, auto-downloaded from Google Storage on first run if missing.
+- **YOLOv8 base** — `face-ai/yolov8n.pt`, must be present (ultralytics will auto-download on first instantiation if absent).
+- **Fire model** — `face-ai/fire_model.pt`, optional. Loaded only if the file exists AND is >1MB (the >1MB check guards against a corrupt/empty placeholder). When absent, fire detection falls back to an HSV color heuristic in `stream_worker` ([face-ai/detect.py:222](face-ai/detect.py#L222)).
+- **LBPH face recognizer** — `cv2.face.LBPHFaceRecognizer_create()`. Requires `opencv-contrib-python`. **Not** `dlib` / `face_recognition` (different stack from older revisions).
 
-The worker processes every 3rd frame (`FRAME_SKIP = 3` in `face-ai/detect.py`) and reconnects on read failure with a 2s backoff. The browser canvas auto-clears 1s after the last detection, so if you slow the worker further, boxes will flicker.
+YOLO person boxes are filtered: `confidence < 0.6` and `bw*bh < 0.05` (relative area) are dropped to suppress false positives on hands and tiny figures. These thresholds are tuned for typical CCTV framing — relaxing them resurfaces noise.
 
 ### Enrollment pipeline
 
-Enrollment images are stored at `face-ai/enrollments/<name>.{jpg,png}`. The backend's `/enroll`, `/enrollments`, `/enrollment/:name` routes write/read this directory directly; names are sanitized to `[a-zA-Z0-9 _-]` + underscores. After every write, the backend bumps the directory's mtime. Each worker polls that mtime per frame and re-computes embeddings when it changes — this is how enrollments hot-reload without restarting detectors.
+Images live at `face-ai/enrollments/<name>_<index>.{jpg,jpeg,png}` (multiple shots per person, numbered). The backend's `/enroll` route writes the next available numbered slot and bumps the directory mtime. Each stream worker watches `os.path.getmtime(ENROLLMENT_DIR)` per frame and calls `train_recognizer()` when it changes ([face-ai/detect.py:147](face-ai/detect.py#L147)) — this is how enrollments hot-reload without restarting anything. Multiple files for the same `name` (the `_<digits>` suffix is stripped to derive the label) all train into one LBPH class.
 
-Name matching only runs when (a) `face_recognition` is importable and (b) at least one enrollment exists. When the COCO model is loaded, the worker searches only the upper ~50% of each person box for a face before embedding — this is the cost-control knob; widening it roughly linearly increases CPU.
+Recognition match: `recognizer.predict(crop)` returns `(label, dist)`; we accept the match when `dist < RECOGNITION_THRESHOLD` (115). LBPH distance is *lower-is-better*, so increasing the threshold is *more permissive*, not less.
+
+Names are sanitized server-side to `[a-zA-Z0-9 _-]` and spaces are converted to underscores on disk; the worker converts them back to spaces when reporting (`names_map`). Underscores in original names will be lost.
 
 ## MediaMTX configuration
 
-[mediamtx/mediamtx.yml](mediamtx/mediamtx.yml) exposes: API on `127.0.0.1:9997`, HLS on `:8888` (fmp4, 1s segments, CORS `*`). Paths are added dynamically via the API — the `all_others: source: publisher` entry is just the fallback for anything not registered by the backend.
+[mediamtx/mediamtx.yml](mediamtx/mediamtx.yml) is intentionally minimal: API on `:9997`, HLS on `:8888`. All path config (auth, transport, source) is set per-path via the API at runtime, not in YAML. The default RTSP ingest port `:8554` is implicit (MediaMTX default) and is what the agent pushes to.
+
+## Adding a remote camera
+
+The backend's auto-spawned agent assumes the RTSP source is reachable from the backend host. For a camera on a different LAN, run `agent/agent.py` manually on that LAN:
+
+```
+python agent/agent.py http://<backend-host>:3000 <pathName> rtsp://<local-camera-ip>/...
+```
+
+Get `<pathName>` from the `streamKey` field in the `/add-camera` response. The agent will register-check, then push.

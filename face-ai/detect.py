@@ -54,17 +54,33 @@ else:
 
 yolo_lock = threading.Lock()
 
-# LBPH recognizer
-recognizer = cv2.face.LBPHFaceRecognizer_create()
-names_map = {}
-recognizer_ready = False
-recognizer_lock = threading.Lock()
+# ── Per-directory LBPH recognizers ──────────────────────────────
+# Each user has their own enrollment dir → their own recognizer.
+# The dict is keyed by absolute path; entries are created lazily.
+class DirRecognizer:
+    __slots__ = ('recognizer', 'names_map', 'ready', 'lock')
+    def __init__(self):
+        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+        self.names_map = {}
+        self.ready = False
+        self.lock = threading.Lock()
+
+dir_recognizers = {}                 # dir_path -> DirRecognizer
+dir_recognizers_lock = threading.Lock()
+
+def get_recognizer(dir_path):
+    with dir_recognizers_lock:
+        rec = dir_recognizers.get(dir_path)
+        if rec is None:
+            rec = DirRecognizer()
+            dir_recognizers[dir_path] = rec
+        return rec
 
 
-def train_recognizer():
-    global recognizer_ready, names_map
-    if not os.path.isdir(ENROLLMENT_DIR):
+def train_recognizer(dir_path):
+    if not dir_path or not os.path.isdir(dir_path):
         return
+    rec = get_recognizer(dir_path)
     faces, labels, name_to_label, next_id = [], [], {}, [0]
 
     def get_label(base):
@@ -73,10 +89,10 @@ def train_recognizer():
             next_id[0] += 1
         return name_to_label[base]
 
-    for fname in sorted(os.listdir(ENROLLMENT_DIR)):
+    for fname in sorted(os.listdir(dir_path)):
         if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
             continue
-        p = os.path.join(ENROLLMENT_DIR, fname)
+        p = os.path.join(dir_path, fname)
         img_bgr = cv2.imread(p)
         if img_bgr is None: continue
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -98,21 +114,21 @@ def train_recognizer():
         else:
             log({'type': 'warning', 'message': f'No face in enrollment: {fname}'})
 
-    with recognizer_lock:
+    with rec.lock:
         if faces:
-            recognizer.train(faces, np.array(labels))
-            names_map = {v: k.replace('_', ' ') for k, v in name_to_label.items()}
-            recognizer_ready = True
+            rec.recognizer.train(faces, np.array(labels))
+            rec.names_map = {v: k.replace('_', ' ') for k, v in name_to_label.items()}
+            rec.ready = True
         else:
-            recognizer_ready = False
+            rec.ready = False
 
 
 # ── Per-stream thread ─────────────────────────────────────────
 active_streams = {}
 
-def stream_worker(stream_id, rtsp_url):
+def stream_worker(stream_id, rtsp_url, enrollment_dir):
     stop_event = active_streams[stream_id]['stop']
-    log({'type': 'info', 'message': f'Stream worker started: {stream_id}'})
+    log({'type': 'info', 'message': f'Stream worker started: {stream_id} (enroll dir: {enrollment_dir})'})
     enrolled_mtime = 0
     cap = None
     frame_idx = 0
@@ -141,14 +157,16 @@ def stream_worker(stream_id, rtsp_url):
         rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        # Auto-retrain
-        if os.path.isdir(ENROLLMENT_DIR):
+        # Auto-retrain when this user's enrollment dir changes
+        if enrollment_dir and os.path.isdir(enrollment_dir):
             try:
-                mtime = os.path.getmtime(ENROLLMENT_DIR)
+                mtime = os.path.getmtime(enrollment_dir)
                 if mtime != enrolled_mtime:
                     enrolled_mtime = mtime
-                    train_recognizer()
+                    train_recognizer(enrollment_dir)
             except: pass
+
+        rec = get_recognizer(enrollment_dir) if enrollment_dir else None
 
         # 1. Face Detection & Recognition
         detections = []
@@ -160,16 +178,17 @@ def stream_worker(stream_id, rtsp_url):
                 for d in result.detections:
                     bb = d.bounding_box
                     name = None
-                    with recognizer_lock:
-                        if recognizer_ready:
-                            x = max(0, bb.origin_x); y = max(0, bb.origin_y)
-                            fw = min(bb.width, w - x); fh = min(bb.height, h - y)
-                            crop = gray[y:y+fh, x:x+fw]
-                            if crop.size > 0:
-                                crop = cv2.resize(crop, (120, 120))
-                                label, dist = recognizer.predict(crop)
-                                if dist < RECOGNITION_THRESHOLD:
-                                    name = names_map.get(label)
+                    if rec is not None:
+                        with rec.lock:
+                            if rec.ready:
+                                x = max(0, bb.origin_x); y = max(0, bb.origin_y)
+                                fw = min(bb.width, w - x); fh = min(bb.height, h - y)
+                                crop = gray[y:y+fh, x:x+fw]
+                                if crop.size > 0:
+                                    crop = cv2.resize(crop, (120, 120))
+                                    label, dist = rec.recognizer.predict(crop)
+                                    if dist < RECOGNITION_THRESHOLD:
+                                        name = rec.names_map.get(label)
                     detections.append({
                         'x': bb.origin_x / w, 'y': bb.origin_y / h,
                         'w': bb.width / w,    'h': bb.height / h,
@@ -254,8 +273,7 @@ def stream_worker(stream_id, rtsp_url):
 
 
 def main():
-    train_recognizer()
-    log({'type': 'ready', 'message': 'Multi-stream worker ready with YOLO incident detection'})
+    log({'type': 'ready', 'message': 'Multi-stream worker ready (per-user recognizers)'})
 
     for raw in sys.stdin:
         raw = raw.strip()
@@ -268,10 +286,12 @@ def main():
         if action == 'add':
             sid = cmd['streamId']
             url = cmd['rtspUrl']
+            # Falls back to the legacy single-tenant root for older callers.
+            enroll_dir = cmd.get('enrollmentDir') or ENROLLMENT_DIR
             if sid not in active_streams:
                 stop_ev = threading.Event()
                 active_streams[sid] = {'stop': stop_ev}
-                t = threading.Thread(target=stream_worker, args=(sid, url), daemon=True)
+                t = threading.Thread(target=stream_worker, args=(sid, url, enroll_dir), daemon=True)
                 t.start()
                 active_streams[sid]['thread'] = t
         elif action == 'remove':
