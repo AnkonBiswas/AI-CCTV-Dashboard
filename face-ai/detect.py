@@ -171,198 +171,262 @@ def train_recognizer(dir_path):
 # ── Per-stream thread ─────────────────────────────────────────
 active_streams = {}
 
+# Detection target rate (frames *processed* per second). The capture thread
+# always reads at the camera's full rate; this just throttles the AI step.
+TARGET_FPS = 8
+
+class LatestFrameReader:
+    """Always-fresh frame source.
+
+    A dedicated capture thread reads the RTSP stream at native frame rate and
+    overwrites a single-slot buffer. The processing thread takes whatever's
+    in the slot — old frames are dropped, so latency cannot accumulate even
+    when AI processing is slower than the incoming frame rate.
+
+    This is *the* fix for the "boxes 3-5s behind reality" problem: with
+    OpenCV's default behavior, a slow consumer queues frames inside FFmpeg's
+    decoder, and you end up processing frames from seconds ago.
+    """
+    __slots__ = ('rtsp_url', 'lock', '_frame', '_frame_id', 'last_frame_at',
+                 'stop_event', 'thread')
+
+    def __init__(self, rtsp_url):
+        self.rtsp_url = rtsp_url
+        self.lock = threading.Lock()
+        self._frame = None
+        self._frame_id = 0
+        self.last_frame_at = 0
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        cap = None
+        while not self.stop_event.is_set():
+            if cap is None or not cap.isOpened():
+                if cap: cap.release()
+                cap = cv2.VideoCapture(self.rtsp_url)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not cap.isOpened():
+                    time.sleep(2); continue
+
+            ret, frame = cap.read()
+            if not ret:
+                cap.release(); cap = None; time.sleep(1); continue
+
+            with self.lock:
+                self._frame = frame
+                self._frame_id += 1
+                self.last_frame_at = time.time()
+
+        if cap: cap.release()
+
+    def take(self, last_seen_id):
+        """Return (frame, id) iff a new frame has arrived since last_seen_id."""
+        with self.lock:
+            if self._frame_id <= last_seen_id:
+                return None, last_seen_id
+            return self._frame, self._frame_id
+
+    def stale(self, threshold_s=10):
+        with self.lock:
+            return self.last_frame_at and (time.time() - self.last_frame_at) > threshold_s
+
+    def stop(self):
+        self.stop_event.set()
+
+
 def stream_worker(stream_id, rtsp_url, enrollment_dir):
     stop_event = active_streams[stream_id]['stop']
     log({'type': 'info', 'message': f'Stream worker started: {stream_id} (enroll dir: {enrollment_dir})'})
     enrolled_mtime = 0
-    cap = None
-    frame_idx = 0
-    last_frame_at = 0  # wall-clock time of last successful frame
+    last_seen_id = 0
+    last_processed_at = 0
+    period = 1.0 / TARGET_FPS
 
     # For incident heuristics (e.g. fight)
     person_history = collections.deque(maxlen=10) # Track person counts/locations
 
-    # Temporal stability for face recognition. Per-slot we track the last
-    # candidate name and a streak counter; only emit a name once the streak
-    # passes RECOGNITION_CONFIRM_FRAMES. We slot by face-box centroid bucket
-    # so different people in the frame don't share a streak.
+    # Temporal stability for face recognition. See COSINE_THRESHOLD docs above.
     name_streaks = {}  # bucket -> {'name': str, 'count': int}
 
-    while not stop_event.is_set():
-        if cap is None or not cap.isOpened():
-            if cap: cap.release()
-            cap = cv2.VideoCapture(rtsp_url)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Reduce lag by minimizing buffer
-            if not cap.isOpened():
-                time.sleep(2); continue
-            last_frame_at = time.time()
+    reader = LatestFrameReader(rtsp_url)
+    try:
+        while not stop_event.is_set():
+            now = time.time()
 
-        # If reads have been silently failing/blocked for too long, force a recycle.
-        if last_frame_at and (time.time() - last_frame_at) > 10:
-            log({'type': 'warning', 'message': f'No frames for 10s on {stream_id}, reopening capture'})
-            cap.release(); cap = None; time.sleep(1); continue
+            # Throttle to TARGET_FPS so AI processing doesn't peg the CPU.
+            if now - last_processed_at < period:
+                time.sleep(0.005)
+                continue
 
-        ret, frame = cap.read()
-        if not ret:
-            cap.release(); cap = None; time.sleep(1); continue
-        last_frame_at = time.time()
+            # Recycle the underlying capture if frames stop flowing.
+            if reader.stale(10):
+                log({'type': 'warning', 'message': f'No frames for 10s on {stream_id}, reopening capture'})
+                reader.stop()
+                reader = LatestFrameReader(rtsp_url)
+                last_seen_id = 0
+                continue
 
-        frame_idx += 1
-        if frame_idx % FRAME_SKIP != 0: continue
+            frame, last_seen_id = reader.take(last_seen_id)
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            last_processed_at = now
 
-        # Downscale for performance (significant CPU saving)
-        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        h, w = small_frame.shape[:2]
-        rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            # Downscale for performance (significant CPU saving)
+            small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+            h, w = small_frame.shape[:2]
+            rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        # Auto-retrain when this user's enrollment dir changes
-        if enrollment_dir and os.path.isdir(enrollment_dir):
+            # Auto-retrain when this user's enrollment dir changes
+            if enrollment_dir and os.path.isdir(enrollment_dir):
+                try:
+                    mtime = os.path.getmtime(enrollment_dir)
+                    if mtime != enrolled_mtime:
+                        enrolled_mtime = mtime
+                        train_recognizer(enrollment_dir)
+                except: pass
+
+            rec = get_recognizer(enrollment_dir) if enrollment_dir else None
+
+            # 1. Face Detection & Recognition
+            detections = []
             try:
-                mtime = os.path.getmtime(enrollment_dir)
-                if mtime != enrolled_mtime:
-                    enrolled_mtime = mtime
-                    train_recognizer(enrollment_dir)
-            except: pass
+                with face_detector_lock:
+                    result = shared_face_detector.detect(mp_img)
+                if result.detections:
+                    seen_buckets = set()
+                    for d in result.detections:
+                        bb = d.bounding_box
+                        name = None
 
-        rec = get_recognizer(enrollment_dir) if enrollment_dir else None
+                        # Tiny faces: low-resolution crops produce noisy embeddings
+                        # — render the box but don't attempt to identify.
+                        face_area_ratio = (bb.width * bb.height) / float(w * h)
 
-        # 1. Face Detection & Recognition
-        detections = []
-        try:
-            with face_detector_lock:
-                result = shared_face_detector.detect(mp_img)
-            if result.detections:
-                seen_buckets = set()
-                for d in result.detections:
-                    bb = d.bounding_box
-                    name = None
-
-                    # Tiny faces: low-resolution crops produce noisy embeddings
-                    # — render the box but don't attempt to identify.
-                    face_area_ratio = (bb.width * bb.height) / float(w * h)
-
-                    if rec is not None and face_area_ratio >= MIN_FACE_AREA_RATIO:
-                        # Read centroids under the per-recognizer lock, then
-                        # release before running FaceNet (which holds its own
-                        # lock); this avoids serializing all streams on a stale
-                        # snapshot if a re-train is in flight.
-                        with rec.lock:
-                            ready = rec.ready
-                            centroids = rec.centroids if ready else None
-                        if ready and centroids:
-                            x = max(0, bb.origin_x); y = max(0, bb.origin_y)
-                            fw = min(bb.width, w - x); fh = min(bb.height, h - y)
-                            crop = small_frame[y:y+fh, x:x+fw]
-                            emb = embed_face(crop)
-                            if emb is not None:
-                                # L2-normalized embeddings → cosine sim = dot product.
-                                best_name, best_score = None, -1.0
-                                for n, c in centroids.items():
-                                    s = float(np.dot(emb, c))
-                                    if s > best_score:
-                                        best_score, best_name = s, n
-                                if best_score >= COSINE_THRESHOLD:
-                                    candidate = best_name
-                                    cx = (bb.origin_x + bb.width / 2) / w
-                                    cy = (bb.origin_y + bb.height / 2) / h
-                                    bucket = (round(cx * 10), round(cy * 10))
-                                    seen_buckets.add(bucket)
-                                    streak = name_streaks.get(bucket)
-                                    if streak and streak['name'] == candidate:
-                                        streak['count'] += 1
-                                    else:
-                                        name_streaks[bucket] = {'name': candidate, 'count': 1}
-                                        streak = name_streaks[bucket]
-                                    if streak['count'] >= RECOGNITION_CONFIRM_FRAMES:
-                                        name = candidate
-                    detections.append({
-                        'x': bb.origin_x / w, 'y': bb.origin_y / h,
-                        'w': bb.width / w,    'h': bb.height / h,
-                        'confidence': float(d.categories[0].score if d.categories else 0),
-                        'label': 'face', 'name': name,
-                    })
-
-                # Drop streak slots that nobody held this frame so we don't
-                # keep a stale name alive after a person leaves the scene.
-                for bucket in list(name_streaks.keys()):
-                    if bucket not in seen_buckets:
-                        del name_streaks[bucket]
-        except Exception as ex:
-            log({'type': 'warning', 'message': f'Face detect error: {ex}'})
-
-        # 2. YOLO Incident Detection (General Objects + Heuristics)
-        incidents = []
-        try:
-            with yolo_lock:
-                # Run YOLOv8 on small frame
-                yolo_results = yolo_model(small_frame, verbose=False)[0]
-                
-                people = []
-                for box in yolo_results.boxes:
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    if conf < 0.6: continue # Increased from 0.3 to reduce false persons
-                    
-                    label = yolo_model.names[cls_id]
-                    bx = box.xyxyn[0].tolist() # [x1, y1, x2, y2]
-                    
-                    if label == 'person':
-                        # Ignore very small boxes that are likely false positives (hands, etc.)
-                        bw = bx[2] - bx[0]
-                        bh = bx[3] - bx[1]
-                        if bw * bh < 0.05: continue 
-                        
-                        people.append(bx)
+                        if rec is not None and face_area_ratio >= MIN_FACE_AREA_RATIO:
+                            # Read centroids under the per-recognizer lock, then
+                            # release before running FaceNet (which holds its own
+                            # lock); this avoids serializing all streams on a stale
+                            # snapshot if a re-train is in flight.
+                            with rec.lock:
+                                ready = rec.ready
+                                centroids = rec.centroids if ready else None
+                            if ready and centroids:
+                                x = max(0, bb.origin_x); y = max(0, bb.origin_y)
+                                fw = min(bb.width, w - x); fh = min(bb.height, h - y)
+                                crop = small_frame[y:y+fh, x:x+fw]
+                                emb = embed_face(crop)
+                                if emb is not None:
+                                    # L2-normalized embeddings → cosine sim = dot product.
+                                    best_name, best_score = None, -1.0
+                                    for n, c in centroids.items():
+                                        s = float(np.dot(emb, c))
+                                        if s > best_score:
+                                            best_score, best_name = s, n
+                                    if best_score >= COSINE_THRESHOLD:
+                                        candidate = best_name
+                                        cx = (bb.origin_x + bb.width / 2) / w
+                                        cy = (bb.origin_y + bb.height / 2) / h
+                                        bucket = (round(cx * 10), round(cy * 10))
+                                        seen_buckets.add(bucket)
+                                        streak = name_streaks.get(bucket)
+                                        if streak and streak['name'] == candidate:
+                                            streak['count'] += 1
+                                        else:
+                                            name_streaks[bucket] = {'name': candidate, 'count': 1}
+                                            streak = name_streaks[bucket]
+                                        if streak['count'] >= RECOGNITION_CONFIRM_FRAMES:
+                                            name = candidate
                         detections.append({
-                            'x': bx[0], 'y': bx[1], 'w': bw, 'h': bh,
-                            'confidence': conf, 'label': 'person'
+                            'x': bb.origin_x / w, 'y': bb.origin_y / h,
+                            'w': bb.width / w,    'h': bb.height / h,
+                            'confidence': float(d.categories[0].score if d.categories else 0),
+                            'label': 'face', 'name': name,
                         })
-                    elif label in ['fire', 'smoke']: # In case custom model is used or standard detects them
-                        incidents.append({'type': 'fire', 'confidence': conf, 'box': bx})
 
-                # If we have a dedicated fire model, run it
-                if fire_model:
-                    f_results = fire_model(frame, verbose=False)[0]
-                    for box in f_results.boxes:
-                        if float(box.conf[0]) > 0.4:
-                            bx = box.xyxyn[0].tolist()
-                            incidents.append({'type': 'fire', 'confidence': float(box.conf[0]), 'box': bx})
-                else:
-                    # Fallback: Color-based detection for small flames (lighters, etc.)
-                    # Look for bright orange/red pixels in HSV space
-                    hsv = cv2.cvtColor(small_frame, cv2.COLOR_BGR2HSV)
-                    # Narrow range: Intense Orange/Red only
-                    lower_fire = np.array([0, 150, 200], dtype="uint8")
-                    upper_fire = np.array([15, 255, 255], dtype="uint8")
-                    mask = cv2.inRange(hsv, lower_fire, upper_fire)
+                    # Drop streak slots that nobody held this frame so we don't
+                    # keep a stale name alive after a person leaves the scene.
+                    for bucket in list(name_streaks.keys()):
+                        if bucket not in seen_buckets:
+                            del name_streaks[bucket]
+            except Exception as ex:
+                log({'type': 'warning', 'message': f'Face detect error: {ex}'})
+
+            # 2. YOLO Incident Detection (General Objects + Heuristics)
+            incidents = []
+            try:
+                with yolo_lock:
+                    # Run YOLOv8 on small frame
+                    yolo_results = yolo_model(small_frame, verbose=False)[0]
+                
+                    people = []
+                    for box in yolo_results.boxes:
+                        cls_id = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        if conf < 0.6: continue # Increased from 0.3 to reduce false persons
                     
-                    # Clean up mask (Dilation to merge close sparks)
-                    mask = cv2.dilate(mask, None, iterations=2)
-                    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                        label = yolo_model.names[cls_id]
+                        bx = box.xyxyn[0].tolist() # [x1, y1, x2, y2]
                     
-                    # Find contours
-                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    for cnt in contours:
-                        area = cv2.contourArea(cnt)
-                        if area > 250: # Increased threshold from 100
-                            x, y, w_cnt, h_cnt = cv2.boundingRect(cnt)
-                            # Shape check: Flames are usually taller than wide or square-ish
-                            if h_cnt / w_cnt > 0.5: 
-                                incidents.append({
-                                    'type': 'fire', 
-                                    'confidence': 0.9, 
-                                    'box': [x/w, y/h, (x+w_cnt)/w, (y+h_cnt)/h]
-                                })
-                                break 
+                        if label == 'person':
+                            # Ignore very small boxes that are likely false positives (hands, etc.)
+                            bw = bx[2] - bx[0]
+                            bh = bx[3] - bx[1]
+                            if bw * bh < 0.05: continue 
+                        
+                            people.append(bx)
+                            detections.append({
+                                'x': bx[0], 'y': bx[1], 'w': bw, 'h': bh,
+                                'confidence': conf, 'label': 'person'
+                            })
+                        elif label in ['fire', 'smoke']: # In case custom model is used or standard detects them
+                            incidents.append({'type': 'fire', 'confidence': conf, 'box': bx})
 
-        except Exception as ex:
-            log({'type': 'warning', 'message': f'YOLO error: {ex}'})
+                    # If we have a dedicated fire model, run it
+                    if fire_model:
+                        f_results = fire_model(frame, verbose=False)[0]
+                        for box in f_results.boxes:
+                            if float(box.conf[0]) > 0.4:
+                                bx = box.xyxyn[0].tolist()
+                                incidents.append({'type': 'fire', 'confidence': float(box.conf[0]), 'box': bx})
+                    else:
+                        # Fallback: Color-based detection for small flames (lighters, etc.)
+                        # Look for bright orange/red pixels in HSV space
+                        hsv = cv2.cvtColor(small_frame, cv2.COLOR_BGR2HSV)
+                        # Narrow range: Intense Orange/Red only
+                        lower_fire = np.array([0, 150, 200], dtype="uint8")
+                        upper_fire = np.array([15, 255, 255], dtype="uint8")
+                        mask = cv2.inRange(hsv, lower_fire, upper_fire)
+                    
+                        # Clean up mask (Dilation to merge close sparks)
+                        mask = cv2.dilate(mask, None, iterations=2)
+                        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                    
+                        # Find contours
+                        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        for cnt in contours:
+                            area = cv2.contourArea(cnt)
+                            if area > 250: # Increased threshold from 100
+                                x, y, w_cnt, h_cnt = cv2.boundingRect(cnt)
+                                # Shape check: Flames are usually taller than wide or square-ish
+                                if h_cnt / w_cnt > 0.5: 
+                                    incidents.append({
+                                        'type': 'fire', 
+                                        'confidence': 0.9, 
+                                        'box': [x/w, y/h, (x+w_cnt)/w, (y+h_cnt)/h]
+                                    })
+                                    break 
 
-        log({'type': 'detections', 'streamId': stream_id, 'detections': detections, 'incidents': incidents})
+            except Exception as ex:
+                log({'type': 'warning', 'message': f'YOLO error: {ex}'})
 
-    if cap: cap.release()
-    log({'type': 'info', 'message': f'Stream worker stopped: {stream_id}'})
+            log({'type': 'detections', 'streamId': stream_id, 'detections': detections, 'incidents': incidents})
+    finally:
+        reader.stop()
+        log({'type': 'info', 'message': f'Stream worker stopped: {stream_id}'})
 
 
 def main():

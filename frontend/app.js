@@ -49,7 +49,24 @@ function setUserChip() {
 const cameras = new Map(); // streamId -> { tile/video/canvas/etc., status }
 const grid = document.getElementById('grid');
 
-const DETECTION_SYNC_DELAY = 1200;
+// Detection events arrive at T + AI_processing (~250ms). The same frame is
+// shown to the user at T + display_latency (WebRTC ~150ms, HLS ~1500ms).
+// To make boxes line up with the visible frame, we delay drawing by
+// (display_latency - AI_processing) — never negative.
+const AI_PROCESSING_OFFSET_MS = 250;
+
+function detectionSyncDelay(cam) {
+  if (!cam) return 0;
+  if (cam.transport === 'webrtc') {
+    // WebRTC display ≈ AI offset, so boxes already align without extra wait.
+    return 50;
+  }
+  if (cam.transport === 'hls' && cam.hls && typeof cam.hls.latency === 'number') {
+    return Math.max(0, Math.round(cam.hls.latency * 1000) - AI_PROCESSING_OFFSET_MS);
+  }
+  // Transport not yet decided — match the old conservative HLS default.
+  return 1200;
+}
 
 const DETECTION_COLORS = {
   recognized: '#10b981',
@@ -94,23 +111,25 @@ function connectSocket() {
   });
 
   socket.on('face_detections', ({ streamId, detections }) => {
+    const cam = cameras.get(streamId);
+    if (!cam) return;
     setTimeout(() => {
-      const cam = cameras.get(streamId);
-      if (!cam) return;
+      if (cam.removed) return;
       cam.lastDetections = detections;
       cam.lastUpdate = Date.now();
       drawDetections(cam);
-    }, DETECTION_SYNC_DELAY);
+    }, detectionSyncDelay(cam));
   });
 
   socket.on('incident_detections', ({ streamId, incidents }) => {
+    const cam = cameras.get(streamId);
+    if (!cam) return;
     setTimeout(() => {
-      const cam = cameras.get(streamId);
-      if (!cam) return;
+      if (cam.removed) return;
       cam.lastIncidents = incidents;
       cam.lastIncidentUpdate = Date.now();
       drawDetections(cam);
-    }, DETECTION_SYNC_DELAY);
+    }, detectionSyncDelay(cam));
   });
 
   socket.on('incident_logged', (row) => {
@@ -152,8 +171,9 @@ function makeTile(streamId, cameraName, rawHlsUrl) {
       <video autoplay muted playsinline crossorigin="anonymous"></video>
       <canvas></canvas>
       <div class="tile-timestamp">—</div>
+      <div class="tile-rec-badge"><span class="rec-dot"></span>REC <span class="rec-elapsed">0:00</span></div>
       <div class="tile-controls">
-        <button class="rec" title="Recording"><svg><use href="#i-record"/></svg></button>
+        <button class="rec" title="Start recording"><svg><use href="#i-record"/></svg></button>
         <button class="screenshot" title="Screenshot"><svg><use href="#i-screenshot"/></svg></button>
         <button class="fullscreen" title="Fullscreen"><svg><use href="#i-fullscreen"/></svg></button>
       </div>
@@ -168,9 +188,13 @@ function makeTile(streamId, cameraName, rawHlsUrl) {
   const statusLabel = tile.querySelector('.status-label');
   const latencyEl = tile.querySelector('.tile-latency');
   const tsEl = tile.querySelector('.tile-timestamp');
+  const recButton = tile.querySelector('.rec');
+  const recBadge = tile.querySelector('.tile-rec-badge');
+  const recElapsed = tile.querySelector('.rec-elapsed');
 
   const cam = {
     streamId, cameraName, tile, video, canvas, statusPill, statusLabel, latencyEl, tsEl,
+    recButton, recBadge, recElapsed,
     hlsUrl, transport: null,
     state: 'connecting',
     lastDetections: [], lastUpdate: 0,
@@ -185,6 +209,7 @@ function makeTile(streamId, cameraName, rawHlsUrl) {
   tile.querySelector('.tile-more').addEventListener('click', (e) => openTileMenu(streamId, e.currentTarget));
   tile.querySelector('.fullscreen').addEventListener('click', () => fullscreenTile(streamId));
   tile.querySelector('.screenshot').addEventListener('click', () => screenshotTile(streamId));
+  recButton.addEventListener('click', () => toggleRecording(streamId));
 
   // Choose transport: WebRTC first, HLS fallback. Stored on cam so the
   // reconnect/ICE handlers can re-trigger startStream without re-deriving them.
@@ -546,6 +571,123 @@ function fullscreenTile(streamId) {
   const wrap = cam.video.parentElement;
   (wrap.requestFullscreen || wrap.webkitRequestFullscreen)?.call(wrap);
 }
+// ── Recording (browser-side via MediaRecorder) ───────────
+const REC_MIME_CANDIDATES = [
+  'video/webm;codecs=vp9,opus',
+  'video/webm;codecs=vp8,opus',
+  'video/webm;codecs=vp9',
+  'video/webm;codecs=vp8',
+  'video/webm',
+  'video/mp4',
+];
+
+function pickRecordingMime() {
+  if (typeof MediaRecorder === 'undefined') return null;
+  for (const t of REC_MIME_CANDIDATES) {
+    if (MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
+function getStreamFromVideo(video) {
+  // WebRTC: video.srcObject is already a MediaStream
+  if (video.srcObject instanceof MediaStream) return video.srcObject;
+  // HLS via MSE: synthesize a MediaStream from the playing video element
+  if (typeof video.captureStream === 'function')    return video.captureStream();
+  if (typeof video.mozCaptureStream === 'function') return video.mozCaptureStream();
+  return null;
+}
+
+function fmtElapsed(ms) {
+  const total = Math.floor(ms / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function toggleRecording(streamId) {
+  const cam = cameras.get(streamId);
+  if (!cam) return;
+  if (cam.recorder && cam.recorder.state === 'recording') stopRecording(cam);
+  else startRecording(cam);
+}
+
+function startRecording(cam) {
+  if (typeof MediaRecorder === 'undefined') {
+    alert('Your browser does not support MediaRecorder.');
+    return;
+  }
+  if (cam.state !== 'live' || !cam.video.videoWidth) {
+    alert('Camera is not live yet — wait until you see the video before recording.');
+    return;
+  }
+  const stream = getStreamFromVideo(cam.video);
+  if (!stream) {
+    alert('Recording is not supported for this stream type in this browser.');
+    return;
+  }
+  const mime = pickRecordingMime();
+  let recorder;
+  try {
+    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+  } catch (err) {
+    alert(`Could not start recorder: ${err.message}`);
+    return;
+  }
+
+  cam.recorder = recorder;
+  cam.recordChunks = [];
+  cam.recordStartedAt = Date.now();
+  cam.recordMime = mime || 'video/webm';
+
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) cam.recordChunks.push(e.data);
+  };
+  recorder.onerror = (e) => {
+    console.error('[Recorder] error', e);
+    alert(`Recording error: ${e.error?.message || 'unknown'}`);
+    stopRecording(cam);
+  };
+  recorder.onstop = () => {
+    finalizeRecording(cam);
+  };
+
+  recorder.start(1000); // chunks every 1s — keeps memory bounded for long recordings
+  cam.recButton.classList.add('recording');
+  cam.recButton.title = 'Stop recording';
+  cam.recBadge.classList.add('show');
+  cam.recElapsed.textContent = '0:00';
+  cam.recTimer = setInterval(() => {
+    cam.recElapsed.textContent = fmtElapsed(Date.now() - cam.recordStartedAt);
+  }, 500);
+}
+
+function stopRecording(cam) {
+  if (cam.recTimer) { clearInterval(cam.recTimer); cam.recTimer = null; }
+  cam.recButton.classList.remove('recording');
+  cam.recButton.title = 'Start recording';
+  cam.recBadge.classList.remove('show');
+  if (cam.recorder && cam.recorder.state !== 'inactive') {
+    try { cam.recorder.stop(); } catch { /* already stopped */ }
+  }
+}
+
+function finalizeRecording(cam) {
+  const chunks = cam.recordChunks || [];
+  cam.recorder = null;
+  cam.recordChunks = [];
+  if (chunks.length === 0) return;
+  const blob = new Blob(chunks, { type: cam.recordMime });
+  const url = URL.createObjectURL(blob);
+  const ext = (cam.recordMime || '').includes('mp4') ? 'mp4' : 'webm';
+  const stamp = new Date(cam.recordStartedAt).toISOString().replace(/[:.]/g, '-').slice(0, -5);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${cam.cameraName.replace(/\s+/g, '_')}-${stamp}.${ext}`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
 function screenshotTile(streamId) {
   const cam = cameras.get(streamId);
   if (!cam) return;
@@ -616,6 +758,9 @@ async function removeCamera(streamId) {
   const cam = cameras.get(streamId);
   if (!cam) return;
   cam.removed = true;
+  // Stop & download any in-progress recording before tearing the stream down,
+  // so the user doesn't lose the footage they were capturing.
+  if (cam.recorder && cam.recorder.state === 'recording') stopRecording(cam);
   clearReconnectTimers(cam);
   await authedFetch(`${API}/camera/${streamId}`, { method: 'DELETE' });
   teardownTransports(cam);
