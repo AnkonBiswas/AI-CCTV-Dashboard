@@ -711,6 +711,75 @@ app.get('/analytics', async (req, res) => {
   }
 });
 
+// ── Analytics charts (per user) ───────────────────────────────
+// Returns aggregated data the Analytics page renders as SVG charts.
+// Single endpoint = single round-trip; the data is small enough.
+app.get('/analytics-charts', async (req, res) => {
+  const userId = req.user.uid;
+  const days = Math.max(1, Math.min(Number(req.query.days) || 7, 90));
+  const since = new Date(Date.now() - days * 24 * 3600 * 1000);
+  const pool = db.getPool();
+  try {
+    const [heatmap] = await pool.query(
+      `SELECT (DAYOFWEEK(created_at) - 1) AS dow, HOUR(created_at) AS hour, COUNT(*) AS n
+       FROM incidents
+       WHERE user_id = ? AND created_at >= ?
+       GROUP BY dow, hour`,
+      [userId, since],
+    );
+    const [byType] = await pool.query(
+      `SELECT type, COUNT(*) AS n
+       FROM incidents
+       WHERE user_id = ? AND created_at >= ?
+       GROUP BY type
+       ORDER BY n DESC`,
+      [userId, since],
+    );
+    const [byCamera] = await pool.query(
+      `SELECT IFNULL(camera_name, 'Unknown') AS camera, COUNT(*) AS n
+       FROM incidents
+       WHERE user_id = ? AND created_at >= ?
+       GROUP BY camera
+       ORDER BY n DESC
+       LIMIT 10`,
+      [userId, since],
+    );
+    const [byPerson] = await pool.query(
+      `SELECT name, COUNT(*) AS n
+       FROM incidents
+       WHERE user_id = ? AND created_at >= ? AND name IS NOT NULL AND name <> ''
+       GROUP BY name
+       ORDER BY n DESC
+       LIMIT 10`,
+      [userId, since],
+    );
+    const [daily] = await pool.query(
+      `SELECT DATE(created_at) AS day, COUNT(*) AS n,
+              SUM(CASE WHEN type IN ('fire','smoke') THEN 1 ELSE 0 END) AS alerts
+       FROM incidents
+       WHERE user_id = ? AND created_at >= ?
+       GROUP BY day
+       ORDER BY day`,
+      [userId, since],
+    );
+    res.json({
+      days,
+      total: byType.reduce((s, r) => s + Number(r.n), 0),
+      heatmap,
+      byType,
+      byCamera,
+      byPerson,
+      daily: daily.map((d) => ({
+        day: (d.day instanceof Date) ? d.day.toISOString().slice(0, 10) : String(d.day).slice(0, 10),
+        n: Number(d.n),
+        alerts: Number(d.alerts || 0),
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Bootstrap persisted cameras on startup ────────────────────
 async function bootstrapCamerasFromDb() {
   const [rows] = await db.getPool().query(

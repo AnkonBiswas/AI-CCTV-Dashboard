@@ -1041,6 +1041,70 @@ button { font-family: inherit; }
 .type-badge.type-visitor  { background: rgba(161,161,170,0.18); color: var(--text-secondary); }
 .type-badge.type-standard { background: rgba(16,185,129,0.14); color: var(--success); }
 
+/* ── Analytics charts ─────────────────────────────────── */
+.analytics-card { padding: 16px 18px; margin-bottom: 16px; }
+.analytics-card .card-head { margin-bottom: 14px; align-items: baseline; }
+.analytics-card .card-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.chart-heatmap, .chart-area { width: 100%; overflow-x: auto; }
+.chart-heatmap svg, .chart-area svg { display: block; max-width: 100%; height: auto; }
+
+.chart-label {
+  font-size: 10px;
+  fill: var(--text-muted);
+  font-family: var(--font);
+}
+.chart-grid {
+  stroke: rgba(255,255,255,0.05);
+  stroke-width: 1;
+}
+
+.chart-bars { display: flex; flex-direction: column; gap: 9px; }
+.hbar-row {
+  display: grid;
+  grid-template-columns: 110px 1fr 44px;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.hbar-label {
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hbar-track {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  height: 8px;
+  overflow: hidden;
+}
+.hbar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), #6366f1);
+  border-radius: 999px;
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.hbar-value {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  font-weight: 500;
+}
+
+.chart-empty {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-style: italic;
+  padding: 32px 12px;
+}
+
 /* File-chip preview inside Add Person modal */
 .enroll-file-list {
   display: flex;

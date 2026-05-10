@@ -1276,6 +1276,186 @@ async function refreshSystemHealth() {
   document.getElementById('sb-cpu-bar').style.width = `${cpuPct}%`;
 }
 
+// ── Analytics page (SVG charts) ──────────────────────────
+const TYPE_COLORS = {
+  fire:   'var(--danger)',
+  smoke:  'var(--danger)',
+  face:   'var(--success)',
+  person: 'var(--warning)',
+};
+
+function heatmapColor(n, max) {
+  if (n === 0 || max === 0) return 'rgba(255,255,255,0.04)';
+  const t = Math.min(n / max, 1);
+  // Mid-range = indigo, hot tail = red. Two-stop gradient.
+  if (t < 0.7) return `rgba(99, 102, 241, ${(0.18 + t * 0.85).toFixed(2)})`;
+  return `rgba(239, 68, 68, ${(0.45 + (t - 0.7) * 1.5).toFixed(2)})`;
+}
+
+function renderHeatmap(rows) {
+  const el = document.getElementById('chart-heatmap');
+  if (!el) return;
+  const grid = Array.from({ length: 7 }, () => Array(24).fill(0));
+  let max = 0;
+  for (const r of rows || []) {
+    if (r.dow >= 0 && r.dow <= 6 && r.hour >= 0 && r.hour <= 23) {
+      const n = Number(r.n);
+      grid[r.dow][r.hour] = n;
+      if (n > max) max = n;
+    }
+  }
+  const cellW = 26, cellH = 22, gap = 2;
+  const labelLeft = 36, labelTop = 18;
+  const W = labelLeft + 24 * (cellW + gap);
+  const H = labelTop + 7 * (cellH + gap);
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  const pieces = [];
+  pieces.push(`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">`);
+  for (let h = 0; h < 24; h += 3) {
+    pieces.push(`<text x="${labelLeft + h * (cellW + gap) + cellW / 2}" y="${labelTop - 4}" text-anchor="middle" class="chart-label">${h}</text>`);
+  }
+  for (let d = 0; d < 7; d++) {
+    const y = labelTop + d * (cellH + gap);
+    pieces.push(`<text x="0" y="${y + cellH / 2 + 4}" class="chart-label">${days[d]}</text>`);
+    for (let h = 0; h < 24; h++) {
+      const x = labelLeft + h * (cellW + gap);
+      const n = grid[d][h];
+      pieces.push(`<rect x="${x}" y="${y}" width="${cellW}" height="${cellH}" rx="3" fill="${heatmapColor(n, max)}"><title>${days[d]} ${h}:00 — ${n} event${n === 1 ? '' : 's'}</title></rect>`);
+    }
+  }
+  pieces.push('</svg>');
+  el.innerHTML = pieces.join('');
+}
+
+function renderDailyTrend(daily) {
+  const el = document.getElementById('chart-daily');
+  if (!el) return;
+  if (!daily || daily.length === 0) {
+    el.innerHTML = '<div class="chart-empty">No data yet.</div>';
+    return;
+  }
+  const W = 720, H = 200, padX = 36, padY = 28;
+  const max = Math.max(...daily.map((d) => d.n), 1);
+  const innerW = W - 2 * padX, innerH = H - 2 * padY;
+  const dx = daily.length > 1 ? innerW / (daily.length - 1) : 0;
+  const xy = (i, val) => [padX + i * dx, H - padY - (val / max) * innerH];
+
+  const pts = daily.map((d, i) => xy(i, d.n));
+  const linePath = pts.map(([x, y], i) => (i === 0 ? 'M' : 'L') + ` ${x.toFixed(1)} ${y.toFixed(1)}`).join(' ');
+  const areaPath = `M ${padX} ${H - padY} ` + pts.map(([x, y]) => `L ${x.toFixed(1)} ${y.toFixed(1)}`).join(' ') + ` L ${padX + innerW} ${H - padY} Z`;
+
+  const ticks = [0, Math.ceil(max / 2), max];
+  const tickLines = ticks.map((t) => {
+    const y = H - padY - (t / max) * innerH;
+    return `<line x1="${padX}" x2="${W - padX}" y1="${y}" y2="${y}" class="chart-grid"/><text x="${padX - 8}" y="${y + 4}" text-anchor="end" class="chart-label">${t}</text>`;
+  }).join('');
+
+  const dots = daily.map((d, i) => {
+    const [x, y] = xy(i, d.n);
+    const alert = d.alerts > 0
+      ? `<circle cx="${x}" cy="${y}" r="6" fill="rgba(239,68,68,0.18)"/>`
+      : '';
+    return `${alert}<circle cx="${x}" cy="${y}" r="3" fill="var(--accent)"><title>${d.day} — ${d.n} events${d.alerts ? `, ${d.alerts} alert${d.alerts === 1 ? '' : 's'}` : ''}</title></circle>`;
+  }).join('');
+
+  // X labels — show ~7 evenly spaced
+  const everyNth = Math.max(1, Math.ceil(daily.length / 7));
+  const xLabels = daily.map((d, i) => {
+    if (i % everyNth !== 0 && i !== daily.length - 1) return '';
+    const [x] = xy(i, d.n);
+    const lbl = new Date(d.day).toLocaleDateString([], { month: 'short', day: 'numeric' });
+    return `<text x="${x}" y="${H - 8}" text-anchor="middle" class="chart-label">${lbl}</text>`;
+  }).join('');
+
+  el.innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
+       ${tickLines}
+       <path d="${areaPath}" fill="rgba(59,130,246,0.18)"/>
+       <path d="${linePath}" stroke="var(--accent)" stroke-width="2" fill="none" stroke-linejoin="round"/>
+       ${dots}
+       ${xLabels}
+     </svg>`;
+}
+
+function renderTypeDonut(byType) {
+  const total = (byType || []).reduce((s, r) => s + Number(r.n), 0);
+  document.getElementById('chart-type-total').textContent = total;
+  const segments = (byType || [])
+    .filter((r) => Number(r.n) > 0)
+    .map((r) => ({ value: Number(r.n), color: TYPE_COLORS[r.type] || 'var(--accent)' }));
+  drawDonut('chart-type-donut', segments.length ? segments : [{ value: 1, color: 'rgba(255,255,255,0.06)' }]);
+
+  const legend = document.getElementById('chart-type-legend');
+  legend.innerHTML = '';
+  if (!byType?.length) {
+    const li = document.createElement('li');
+    li.className = 'chart-empty';
+    li.textContent = 'No detections yet.';
+    legend.appendChild(li);
+    return;
+  }
+  for (const r of byType) {
+    const li = document.createElement('li');
+    const dot = document.createElement('span');
+    dot.className = 'leg-dot';
+    dot.style.background = TYPE_COLORS[r.type] || 'var(--accent)';
+    const label = document.createElement('span');
+    label.className = 'leg-label';
+    const n = document.createElement('b');
+    n.textContent = r.n;
+    label.append(n, ' ' + r.type);
+    li.append(dot, label);
+    legend.appendChild(li);
+  }
+}
+
+function renderHorizontalBars(elId, rows, labelKey, valueKey) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (!rows || rows.length === 0) {
+    el.innerHTML = '<div class="chart-empty">No data yet.</div>';
+    return;
+  }
+  const max = Math.max(...rows.map((r) => Number(r[valueKey])), 1);
+  el.innerHTML = '';
+  for (const r of rows) {
+    const row = document.createElement('div');
+    row.className = 'hbar-row';
+    const lbl = document.createElement('span');
+    lbl.className = 'hbar-label';
+    lbl.textContent = r[labelKey];
+    lbl.title = r[labelKey];
+    const track = document.createElement('div');
+    track.className = 'hbar-track';
+    const fill = document.createElement('div');
+    fill.className = 'hbar-fill';
+    fill.style.width = `${(Number(r[valueKey]) / max) * 100}%`;
+    track.appendChild(fill);
+    const val = document.createElement('span');
+    val.className = 'hbar-value';
+    val.textContent = r[valueKey];
+    row.append(lbl, track, val);
+    el.appendChild(row);
+  }
+}
+
+async function refreshAnalyticsCharts() {
+  const sel = document.getElementById('analytics-charts-period');
+  const days = Number(sel?.value || 7);
+  let data;
+  try {
+    data = await (await authedFetch(`${API}/analytics-charts?days=${days}`)).json();
+  } catch { return; }
+  renderHeatmap(data.heatmap);
+  renderDailyTrend(data.daily);
+  renderTypeDonut(data.byType);
+  renderHorizontalBars('chart-camera', data.byCamera, 'camera', 'n');
+  renderHorizontalBars('chart-people', data.byPerson, 'name', 'n');
+}
+
+document.getElementById('analytics-charts-period')?.addEventListener('change', refreshAnalyticsCharts);
+
 // ── Routing (stub-friendly) ──────────────────────────────
 const PAGES = {
   dashboard: 'page-dashboard', live: 'page-dashboard',
@@ -1283,6 +1463,7 @@ const PAGES = {
   users:     'page-users',
   events:    'page-events',
   alerts:    'page-events',
+  analytics: 'page-analytics',
   settings:  'page-settings',
 };
 const PAGE_TITLES = {
@@ -1299,9 +1480,10 @@ function showRoute(route) {
     document.getElementById('stub-title').textContent = `${route[0].toUpperCase() + route.slice(1)} — coming soon`;
     document.getElementById('stub-desc').textContent  = 'This section is on the roadmap. We\'ll build it out next.';
   }
-  if (route === 'cameras')  refreshCamerasTable();
-  if (route === 'users')    refreshEnrollments();
-  if (route === 'settings') refreshFeatures();
+  if (route === 'cameras')   refreshCamerasTable();
+  if (route === 'users')     refreshEnrollments();
+  if (route === 'settings')  refreshFeatures();
+  if (route === 'analytics') refreshAnalyticsCharts();
   if (route === 'events' || route === 'alerts') {
     document.getElementById('events-title').textContent = PAGE_TITLES[route];
     refreshEventsTable();

@@ -101,7 +101,7 @@
         <a class="nav-item"        data-route="events"><svg><use href="#i-bell"/></svg>Events<span class="nav-badge" id="nav-events-badge">0</span></a>
         <a class="nav-item"        data-route="cameras"><svg><use href="#i-camera"/></svg>Cameras</a>
         <a class="nav-item disabled" data-route="maps"><svg><use href="#i-map"/></svg>Maps<span class="soon">Soon</span></a>
-        <a class="nav-item disabled" data-route="analytics"><svg><use href="#i-chart"/></svg>Analytics<span class="soon">Soon</span></a>
+        <a class="nav-item"        data-route="analytics"><svg><use href="#i-chart"/></svg>Analytics</a>
         <a class="nav-item disabled" data-route="reports"><svg><use href="#i-doc"/></svg>Reports<span class="soon">Soon</span></a>
         <a class="nav-item"        data-route="alerts"><svg><use href="#i-alert"/></svg>Alerts</a>
         <a class="nav-item"        data-route="users"><svg><use href="#i-users"/></svg>Users</a>
@@ -298,6 +298,69 @@
             <thead><tr><th>Type</th><th>Camera</th><th>Person</th><th>Confidence</th><th>Time</th></tr></thead>
             <tbody></tbody>
           </table>
+        </section>
+      </section>
+
+      <!-- Analytics page -->
+      <section class="page" id="page-analytics" style="display:none">
+        <div class="page-header">
+          <div>
+            <h1 class="page-title">Analytics</h1>
+            <p class="page-sub">Patterns and trends across your incident log.</p>
+          </div>
+          <div class="page-actions">
+            <div class="select-wrap">
+              <svg><use href="#i-chart"/></svg>
+              <select id="analytics-charts-period">
+                <option value="7" selected>Last 7 days</option>
+                <option value="14">Last 14 days</option>
+                <option value="30">Last 30 days</option>
+                <option value="90">Last 90 days</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <section class="card analytics-card">
+          <header class="card-head">
+            <h2>Activity heatmap</h2>
+            <span class="card-sub">Detections by hour of day × day of week</span>
+          </header>
+          <div id="chart-heatmap" class="chart-heatmap"></div>
+        </section>
+
+        <section class="card analytics-card">
+          <header class="card-head">
+            <h2>Detections over time</h2>
+            <span class="card-sub">Total events per day · alerts highlighted</span>
+          </header>
+          <div id="chart-daily" class="chart-area"></div>
+        </section>
+
+        <div class="info-cards" style="grid-template-columns: 1fr 1fr">
+          <section class="card analytics-card">
+            <header class="card-head"><h2>Detections by type</h2></header>
+            <div class="donut-row">
+              <div class="donut-stack">
+                <svg id="chart-type-donut" class="donut" viewBox="0 0 100 100"></svg>
+                <div class="donut-center">
+                  <div class="donut-num" id="chart-type-total">0</div>
+                  <div class="donut-label">Events</div>
+                </div>
+              </div>
+              <ul id="chart-type-legend" class="legend"></ul>
+            </div>
+          </section>
+
+          <section class="card analytics-card">
+            <header class="card-head"><h2>By camera</h2></header>
+            <div id="chart-camera" class="chart-bars"></div>
+          </section>
+        </div>
+
+        <section class="card analytics-card">
+          <header class="card-head"><h2>Top recognized people</h2></header>
+          <div id="chart-people" class="chart-bars"></div>
         </section>
       </section>
 
