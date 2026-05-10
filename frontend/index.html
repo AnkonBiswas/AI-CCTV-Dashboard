@@ -5,11 +5,15 @@
   <meta charset="utf-8">
   <title>SecureVision · Surveillance Dashboard</title>
   <link rel="stylesheet" href="style.css">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <!-- Inter font from Google Fonts is non-blocking: if offline / air-gapped,
+       the CSS font stack falls back to system-ui (still looks clean). -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
-  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+        media="print" onload="this.media='all'">
+  <script src="vendor/hls.min.js"></script>
+  <script src="vendor/socket.io.min.js"></script>
 </head>
 
 <body>

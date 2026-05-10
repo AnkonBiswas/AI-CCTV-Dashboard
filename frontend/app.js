@@ -223,8 +223,8 @@ function makeTile(streamId, cameraName, rawHlsUrl) {
 }
 
 // ── Stream transport: WebRTC primary, HLS fallback, with retry/upgrade ─
-const RECONNECT_DELAY_MS = 5000;   // when both transports fail, retry whole flow this often
-const PROMOTE_DELAY_MS   = 30000;  // while on HLS, retry WebRTC this often (free upgrade if it works)
+const RECONNECT_DELAY_MS = 5000;  // when both transports fail, retry whole flow this often
+const PROMOTE_DELAY_MS   = 8000;  // while on HLS, retry WebRTC this often (free upgrade if it works)
 
 async function probeManifest(hlsUrl) {
   try {
@@ -305,9 +305,10 @@ async function startStream(cam, hlsUrl, pathName) {
 
 async function startWebRTC(cam, pathName) {
   const url = `${WEBRTC_BASE}/${pathName}/whep`;
-  const pc = new RTCPeerConnection({
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-  });
+  // Empty iceServers = host-candidate-only ICE. Works on the same LAN with no
+  // internet (same machine or same WiFi). For deployments behind NAT or across
+  // the public internet, add a STUN/TURN server here.
+  const pc = new RTCPeerConnection({ iceServers: [] });
   cam.pc = pc;
 
   pc.addTransceiver('video', { direction: 'recvonly' });
@@ -317,6 +318,9 @@ async function startWebRTC(cam, pathName) {
     pc.ontrack = (ev) => {
       if (ev.streams && ev.streams[0]) {
         cam.video.srcObject = ev.streams[0];
+        // Minimum jitter buffer — saves ~200-500ms of glass-to-glass latency
+        // on a healthy LAN. Browsers may ignore values they consider unsafe.
+        try { ev.receiver.playoutDelayHint = 0; } catch {}
         resolve();
       }
     };
