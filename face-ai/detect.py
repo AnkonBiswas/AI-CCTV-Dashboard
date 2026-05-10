@@ -13,6 +13,8 @@ import cv2, numpy as np, mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from ultralytics import YOLO
+import torch
+from facenet_pytorch import InceptionResnetV1
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENROLLMENT_DIR = os.path.join(HERE, 'enrollments')
@@ -22,13 +24,13 @@ FIRE_MODEL_PATH = os.path.join(HERE, 'fire_model.pt') # Optional custom model
 
 FRAME_SKIP = 5               # Process every 5th frame to reduce CPU load
 
-# LBPH face-recognition strictness. LBPH distance is "lower is better".
-#   < 50  : very strict, near-perfect lighting/pose required (lots of "Unknown")
-#   50-70 : strict — only confident matches get a name (recommended for live cams)
-#   70-90 : moderate — relaxed enough for varied lighting; some look-alikes leak
-#   > 100 : loose — false matches between similar-looking people are common
-# Override via FACE_RECOGNITION_THRESHOLD env var without editing the file.
-RECOGNITION_THRESHOLD     = int(os.environ.get('FACE_RECOGNITION_THRESHOLD', '70'))
+# FaceNet (vggface2) cosine-similarity threshold. Higher = stricter.
+#   > 0.65 : very strict, near-identical conditions required
+#   0.50   : strict — recommended default for live CCTV (cuts most look-alike confusion)
+#   0.40   : moderate — accepts more pose/lighting variation, occasional false matches
+#   < 0.30 : loose — most distinct people will collide
+# Override via FACE_COSINE_THRESHOLD env var (no code edit needed).
+COSINE_THRESHOLD          = float(os.environ.get('FACE_COSINE_THRESHOLD', '0.50'))
 
 # Faces smaller than this fraction of the (downscaled) frame area are too noisy
 # to recognize reliably. Below the cutoff we still detect the face but don't
@@ -80,14 +82,35 @@ else:
 
 yolo_lock = threading.Lock()
 
-# ── Per-directory LBPH recognizers ──────────────────────────────
-# Each user has their own enrollment dir → their own recognizer.
-# The dict is keyed by absolute path; entries are created lazily.
+# ── FaceNet (vggface2) embedder ─────────────────────────────────
+# 27M-param InceptionResnetV1 from facenet-pytorch. Outputs L2-normalized
+# 512-d embeddings; cosine similarity = dot product.
+# First import downloads ~107MB into ~/.cache/torch/checkpoints/.
+_torch_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+log({'type': 'info', 'message': f'Loading FaceNet (vggface2) on {_torch_device}'})
+_face_net = InceptionResnetV1(pretrained='vggface2').eval().to(_torch_device)
+_face_net_lock = threading.Lock()
+
+def embed_face(crop_bgr):
+    """Return an L2-normalized 512-d FaceNet embedding for a BGR face crop."""
+    if crop_bgr is None or crop_bgr.size == 0:
+        return None
+    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.resize(rgb, (160, 160), interpolation=cv2.INTER_AREA)
+    t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float()
+    t = (t - 127.5) / 128.0  # facenet-pytorch normalization
+    with _face_net_lock, torch.no_grad():
+        emb = _face_net(t.to(_torch_device))
+    return emb.cpu().numpy().flatten()
+
+
+# ── Per-directory recognizers ───────────────────────────────────
+# Each user has their own enrollment dir → their own centroid table.
+# Keyed by absolute dir path; entries are created lazily.
 class DirRecognizer:
-    __slots__ = ('recognizer', 'names_map', 'ready', 'lock')
+    __slots__ = ('centroids', 'ready', 'lock')
     def __init__(self):
-        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
-        self.names_map = {}
+        self.centroids = {}    # name -> np.ndarray(512,) L2-normalized
         self.ready = False
         self.lock = threading.Lock()
 
@@ -104,16 +127,11 @@ def get_recognizer(dir_path):
 
 
 def train_recognizer(dir_path):
+    """Compute one mean embedding per enrolled name from images on disk."""
     if not dir_path or not os.path.isdir(dir_path):
         return
     rec = get_recognizer(dir_path)
-    faces, labels, name_to_label, next_id = [], [], {}, [0]
-
-    def get_label(base):
-        if base not in name_to_label:
-            name_to_label[base] = next_id[0]
-            next_id[0] += 1
-        return name_to_label[base]
+    name_to_embs = {}  # display name -> [embedding, ...]
 
     for fname in sorted(os.listdir(dir_path)):
         if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
@@ -121,32 +139,33 @@ def train_recognizer(dir_path):
         p = os.path.join(dir_path, fname)
         img_bgr = cv2.imread(p)
         if img_bgr is None: continue
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        rgb  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        stem = os.path.splitext(fname)[0]
-        base = re.sub(r'_\d+$', '', stem)
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         with face_detector_lock:
             result = shared_face_detector.detect(mp_img)
-        if result.detections:
-            bb = result.detections[0].bounding_box
-            ih, iw = gray.shape
-            x = max(0, bb.origin_x); y = max(0, bb.origin_y)
-            w = min(bb.width, iw - x); h = min(bb.height, ih - y)
-            crop = gray[y:y+h, x:x+w]
-            if crop.size > 0:
-                faces.append(cv2.resize(crop, (120, 120)))
-                labels.append(get_label(base))
-        else:
+        if not result.detections:
             log({'type': 'warning', 'message': f'No face in enrollment: {fname}'})
+            continue
+        bb = result.detections[0].bounding_box
+        ih, iw = img_bgr.shape[:2]
+        x = max(0, bb.origin_x); y = max(0, bb.origin_y)
+        cw = min(bb.width, iw - x); ch = min(bb.height, ih - y)
+        emb = embed_face(img_bgr[y:y+ch, x:x+cw])
+        if emb is None: continue
+        stem = os.path.splitext(fname)[0]
+        base = re.sub(r'_\d+$', '', stem).replace('_', ' ')
+        name_to_embs.setdefault(base, []).append(emb)
+
+    centroids = {}
+    for name, embs in name_to_embs.items():
+        c = np.mean(np.stack(embs), axis=0)
+        n = np.linalg.norm(c) + 1e-9
+        centroids[name] = (c / n).astype(np.float32)
 
     with rec.lock:
-        if faces:
-            rec.recognizer.train(faces, np.array(labels))
-            rec.names_map = {v: k.replace('_', ' ') for k, v in name_to_label.items()}
-            rec.ready = True
-        else:
-            rec.ready = False
+        rec.centroids = centroids
+        rec.ready = bool(centroids)
+    log({'type': 'info', 'message': f'Trained {len(centroids)} identities from {dir_path}'})
 
 
 # ── Per-stream thread ─────────────────────────────────────────
@@ -214,40 +233,49 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
             with face_detector_lock:
                 result = shared_face_detector.detect(mp_img)
             if result.detections:
-                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
                 seen_buckets = set()
                 for d in result.detections:
                     bb = d.bounding_box
                     name = None
 
-                    # Skip recognition for very small faces — LBPH on tiny crops
-                    # produces near-random matches.
+                    # Tiny faces: low-resolution crops produce noisy embeddings
+                    # — render the box but don't attempt to identify.
                     face_area_ratio = (bb.width * bb.height) / float(w * h)
 
                     if rec is not None and face_area_ratio >= MIN_FACE_AREA_RATIO:
+                        # Read centroids under the per-recognizer lock, then
+                        # release before running FaceNet (which holds its own
+                        # lock); this avoids serializing all streams on a stale
+                        # snapshot if a re-train is in flight.
                         with rec.lock:
-                            if rec.ready:
-                                x = max(0, bb.origin_x); y = max(0, bb.origin_y)
-                                fw = min(bb.width, w - x); fh = min(bb.height, h - y)
-                                crop = gray[y:y+fh, x:x+fw]
-                                if crop.size > 0:
-                                    crop = cv2.resize(crop, (120, 120))
-                                    label, dist = rec.recognizer.predict(crop)
-                                    if dist < RECOGNITION_THRESHOLD:
-                                        candidate = rec.names_map.get(label)
-                                        # Temporal smoothing: bucket by face-centroid (~10% grid)
-                                        cx = (bb.origin_x + bb.width / 2) / w
-                                        cy = (bb.origin_y + bb.height / 2) / h
-                                        bucket = (round(cx * 10), round(cy * 10))
-                                        seen_buckets.add(bucket)
-                                        s = name_streaks.get(bucket)
-                                        if s and s['name'] == candidate:
-                                            s['count'] += 1
-                                        else:
-                                            name_streaks[bucket] = {'name': candidate, 'count': 1}
-                                            s = name_streaks[bucket]
-                                        if s['count'] >= RECOGNITION_CONFIRM_FRAMES:
-                                            name = candidate
+                            ready = rec.ready
+                            centroids = rec.centroids if ready else None
+                        if ready and centroids:
+                            x = max(0, bb.origin_x); y = max(0, bb.origin_y)
+                            fw = min(bb.width, w - x); fh = min(bb.height, h - y)
+                            crop = small_frame[y:y+fh, x:x+fw]
+                            emb = embed_face(crop)
+                            if emb is not None:
+                                # L2-normalized embeddings → cosine sim = dot product.
+                                best_name, best_score = None, -1.0
+                                for n, c in centroids.items():
+                                    s = float(np.dot(emb, c))
+                                    if s > best_score:
+                                        best_score, best_name = s, n
+                                if best_score >= COSINE_THRESHOLD:
+                                    candidate = best_name
+                                    cx = (bb.origin_x + bb.width / 2) / w
+                                    cy = (bb.origin_y + bb.height / 2) / h
+                                    bucket = (round(cx * 10), round(cy * 10))
+                                    seen_buckets.add(bucket)
+                                    streak = name_streaks.get(bucket)
+                                    if streak and streak['name'] == candidate:
+                                        streak['count'] += 1
+                                    else:
+                                        name_streaks[bucket] = {'name': candidate, 'count': 1}
+                                        streak = name_streaks[bucket]
+                                    if streak['count'] >= RECOGNITION_CONFIRM_FRAMES:
+                                        name = candidate
                     detections.append({
                         'x': bb.origin_x / w, 'y': bb.origin_y / h,
                         'w': bb.width / w,    'h': bb.height / h,
