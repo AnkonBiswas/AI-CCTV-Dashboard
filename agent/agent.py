@@ -72,32 +72,50 @@ def download_ffmpeg():
     """Downloads a portable ffmpeg.exe for Windows if missing."""
     if os.name != 'nt':
         return False
-    
+
     url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
     here = os.path.dirname(os.path.abspath(__file__))
     target = os.path.join(here, "ffmpeg.exe")
     zip_path = os.path.join(here, "ffmpeg.zip")
+
+    # Wipe any leftover corrupt zip from a previous interrupted attempt.
+    if os.path.exists(zip_path):
+        try: os.remove(zip_path)
+        except OSError: pass
 
     print("[Agent] FFmpeg missing. Attempting automatic download for Windows...")
     try:
         print(f"[Agent] Downloading from {url}...")
         with urllib.request.urlopen(url) as response, open(zip_path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
-        
+
+        # Verify the zip is intact before extracting.
+        if not zipfile.is_zipfile(zip_path):
+            raise RuntimeError("downloaded file is not a valid zip — try again or install ffmpeg manually")
+
         print("[Agent] Extracting ffmpeg.exe...")
         with zipfile.ZipFile(zip_path, 'r') as z:
-            # Find the bin/ffmpeg.exe inside the nested folder in the zip
             exe_member = next((m for m in z.namelist() if m.endswith('bin/ffmpeg.exe')), None)
-            if exe_member:
-                with z.open(exe_member) as source, open(target, 'wb') as dest:
-                    shutil.copyfileobj(source, dest)
-                print(f"[Agent] Successfully installed to {target}")
-                return target
+            if not exe_member:
+                raise RuntimeError("zip did not contain bin/ffmpeg.exe (unexpected build layout)")
+            with z.open(exe_member) as source, open(target, 'wb') as dest:
+                shutil.copyfileobj(source, dest)
+
+        if not os.path.exists(target) or os.path.getsize(target) < 1_000_000:
+            raise RuntimeError("ffmpeg.exe extracted but looks truncated")
+
+        print(f"[Agent] Successfully installed to {target}")
+        return target
     except Exception as e:
         print(f"[Agent] Auto-download failed: {e}")
+        # Clean up an aborted target so a re-run sees a missing exe instead of a partial one.
+        if os.path.exists(target):
+            try: os.remove(target)
+            except OSError: pass
     finally:
         if os.path.exists(zip_path):
-            os.remove(zip_path)
+            try: os.remove(zip_path)
+            except OSError: pass
     return None
 
 def check_ffmpeg():
@@ -123,17 +141,51 @@ def check_ffmpeg():
     print("=" * 60)
     return None
 
+_ffmpeg_timeout_flag_cache = None
+def _ffmpeg_rtsp_timeout_flag(ffmpeg_cmd):
+    """Return '-timeout' for ffmpeg 5+, '-stimeout' for older builds.
+
+    ffmpeg 8.x removed `-stimeout` (option not found = process exits before
+    even attempting the stream). Older ffmpeg 4.x/early 5.x used `-stimeout`.
+    Sniffing the banner lets us support both without an upgrade requirement.
+    """
+    global _ffmpeg_timeout_flag_cache
+    if _ffmpeg_timeout_flag_cache is not None:
+        return _ffmpeg_timeout_flag_cache
+    try:
+        out = subprocess.run([ffmpeg_cmd, '-version'], capture_output=True, text=True, timeout=5)
+        banner = (out.stdout + out.stderr).splitlines()[0] if (out.stdout or out.stderr) else ''
+        m = re.search(r'ffmpeg version (\d+)', banner)
+        major = int(m.group(1)) if m else 0
+    except Exception:
+        major = 0
+    _ffmpeg_timeout_flag_cache = '-timeout' if major >= 5 else '-stimeout'
+    return _ffmpeg_timeout_flag_cache
+
+
 def run_ffmpeg(ffmpeg_cmd, local_rtsp, push_url):
-    """Start FFmpeg to bridge local RTSP → remote MediaMTX."""
+    """Start FFmpeg to bridge local RTSP → remote MediaMTX.
+
+    `-stimeout` is critical: without it, if the camera goes silent (phone
+    sleeps, app closes, network blip), ffmpeg's RTSP read can block forever
+    and our retry loop never sees an exit. 5s in microseconds is plenty for
+    a healthy camera but bounded enough to recover quickly.
+    """
+    # ffmpeg 5+ uses `-timeout`; older builds use `-stimeout`. Both are RTSP
+    # socket-IO timeouts in microseconds. We pick at runtime by sniffing the
+    # version banner so this works on both old and new ffmpeg installs.
     cmd = [
         ffmpeg_cmd,
         '-loglevel', 'warning',
+        # Input (camera) options
         '-rtsp_transport', 'tcp',
+        _ffmpeg_rtsp_timeout_flag(ffmpeg_cmd), '5000000',
         '-i', local_rtsp,
         '-c', 'copy',
+        # Output (MediaMTX) options
         '-f', 'rtsp',
         '-rtsp_transport', 'tcp',
-        push_url
+        push_url,
     ]
     print(f"[Agent] Bridging stream:")
     print(f"  Source  : {local_rtsp}")

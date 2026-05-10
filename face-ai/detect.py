@@ -1,4 +1,14 @@
 import sys, os, json, time, threading, re, collections
+
+# Force OpenCV's FFmpeg RTSP backend to use TCP and bail on dead reads/opens.
+# Must be set BEFORE `import cv2` because cv2 caches it on first VideoCapture.
+# stimeout/timeout are in microseconds; 5s is enough for a slow camera but
+# short enough that a hung MediaMTX path recycles instead of wedging the thread.
+os.environ.setdefault(
+    'OPENCV_FFMPEG_CAPTURE_OPTIONS',
+    'rtsp_transport;tcp|stimeout;5000000|timeout;5000000',
+)
+
 import cv2, numpy as np, mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -132,6 +142,7 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
     enrolled_mtime = 0
     cap = None
     frame_idx = 0
+    last_frame_at = 0  # wall-clock time of last successful frame
 
     # For incident heuristics (e.g. fight)
     person_history = collections.deque(maxlen=10) # Track person counts/locations
@@ -143,10 +154,17 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Reduce lag by minimizing buffer
             if not cap.isOpened():
                 time.sleep(2); continue
+            last_frame_at = time.time()
+
+        # If reads have been silently failing/blocked for too long, force a recycle.
+        if last_frame_at and (time.time() - last_frame_at) > 10:
+            log({'type': 'warning', 'message': f'No frames for 10s on {stream_id}, reopening capture'})
+            cap.release(); cap = None; time.sleep(1); continue
 
         ret, frame = cap.read()
         if not ret:
             cap.release(); cap = None; time.sleep(1); continue
+        last_frame_at = time.time()
 
         frame_idx += 1
         if frame_idx % FRAME_SKIP != 0: continue

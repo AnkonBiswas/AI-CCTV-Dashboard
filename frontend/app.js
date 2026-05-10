@@ -2,6 +2,13 @@ const API = window.location.hostname === 'localhost' || window.location.hostname
   ? 'http://localhost:3000'
   : `${window.location.protocol}//${window.location.hostname}:3000`;
 
+const WEBRTC_BASE = (() => {
+  const h = window.location.hostname;
+  return (h === 'localhost' || h === '127.0.0.1')
+    ? 'http://localhost:8889'
+    : `${window.location.protocol}//${h}:8889`;
+})();
+
 // ── Auth state ───────────────────────────────────────────
 const TOKEN_KEY = 'cctv_token';
 let token = localStorage.getItem(TOKEN_KEY);
@@ -164,6 +171,7 @@ function makeTile(streamId, cameraName, rawHlsUrl) {
 
   const cam = {
     streamId, cameraName, tile, video, canvas, statusPill, statusLabel, latencyEl, tsEl,
+    hlsUrl, transport: null,
     state: 'connecting',
     lastDetections: [], lastUpdate: 0,
     lastIncidents: [], lastIncidentUpdate: 0,
@@ -178,43 +186,20 @@ function makeTile(streamId, cameraName, rawHlsUrl) {
   tile.querySelector('.fullscreen').addEventListener('click', () => fullscreenTile(streamId));
   tile.querySelector('.screenshot').addEventListener('click', () => screenshotTile(streamId));
 
-  // hls.js
-  const src = hlsUrl + 'index.m3u8';
-  if (window.Hls && Hls.isSupported()) {
-    const hls = new Hls({
-      lowLatencyMode: true, enableWorker: true,
-      backBufferLength: 0, maxBufferLength: 4, maxMaxBufferLength: 8,
-      liveSyncDuration: 0.5, liveMaxLatencyDuration: 2,
-      liveDurationInfinity: true, maxLiveSyncPlaybackRate: 2.0,
-      manifestLoadingMaxRetry: 10,
-    });
-    hls.loadSource(src);
-    hls.attachMedia(video);
-    cam.hls = hls;
-    hls.on(Hls.Events.ERROR, (_e, data) => {
-      if (!data.fatal) return;
-      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) setTimeout(() => hls.startLoad(), 1000);
-      else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-      else setTimeout(() => { hls.loadSource(src); hls.startLoad(); }, 2000);
-    });
-    let lastT = 0, stalled = 0;
-    cam.stallWatchdog = setInterval(() => {
-      if (video.paused || video.ended || !video.src) return;
-      if (video.currentTime === lastT) {
-        stalled += 1;
-        if (stalled >= 4 && hls.liveSyncPosition != null) {
-          video.currentTime = hls.liveSyncPosition;
-          video.play().catch(() => {});
-          stalled = 0;
-        }
-      } else { stalled = 0; lastT = video.currentTime; }
-    }, 1000);
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = src;
-  }
+  // Choose transport: WebRTC first, HLS fallback. Stored on cam so the
+  // reconnect/ICE handlers can re-trigger startStream without re-deriving them.
+  const pathName = (rawHlsUrl.match(/\/([^/]+)\/?$/) || [])[1];
+  cam.pathName = pathName;
+  startStream(cam, hlsUrl, pathName);
 
   video.addEventListener('loadedmetadata', () => resizeCanvas(cam));
-  window.addEventListener('resize', () => resizeCanvas(cam));
+  video.addEventListener('playing',        () => resizeCanvas(cam));
+  window.addEventListener('resize',         () => resizeCanvas(cam));
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => resizeCanvas(cam));
+    ro.observe(video);
+    cam.resizeObserver = ro;
+  }
 
   cam.tsTimer = setInterval(() => { tsEl.textContent = fmtTimestamp(); }, 1000);
 
@@ -237,6 +222,193 @@ function makeTile(streamId, cameraName, rawHlsUrl) {
   return cam;
 }
 
+// ── Stream transport: WebRTC primary, HLS fallback, with retry/upgrade ─
+const RECONNECT_DELAY_MS = 5000;   // when both transports fail, retry whole flow this often
+const PROMOTE_DELAY_MS   = 30000;  // while on HLS, retry WebRTC this often (free upgrade if it works)
+
+async function probeManifest(hlsUrl) {
+  try {
+    const r = await fetch(hlsUrl + 'index.m3u8', { method: 'HEAD', cache: 'no-store' });
+    return r.ok;
+  } catch { return false; }
+}
+
+function teardownTransports(cam) {
+  teardownWebRTC(cam);
+  if (cam.hls) { try { cam.hls.destroy(); } catch {} cam.hls = null; }
+  if (cam.stallWatchdog) { clearInterval(cam.stallWatchdog); cam.stallWatchdog = null; }
+}
+
+function clearReconnectTimers(cam) {
+  if (cam.reconnectTimer) { clearTimeout(cam.reconnectTimer); cam.reconnectTimer = null; }
+  if (cam.promoteTimer)   { clearTimeout(cam.promoteTimer);   cam.promoteTimer   = null; }
+}
+
+function scheduleReconnect(cam, hlsUrl, pathName, delay = RECONNECT_DELAY_MS) {
+  if (cam.removed) return;
+  clearTimeout(cam.reconnectTimer);
+  cam.reconnectTimer = setTimeout(() => startStream(cam, hlsUrl, pathName), delay);
+}
+
+function schedulePromote(cam, hlsUrl, pathName) {
+  if (cam.removed) return;
+  clearTimeout(cam.promoteTimer);
+  cam.promoteTimer = setTimeout(async () => {
+    if (cam.removed || cam.transport !== 'hls') return;
+    try {
+      // Probe WebRTC silently; on success, srcObject takes over and we kill HLS.
+      await startWebRTC(cam, pathName);
+      if (cam.hls) { try { cam.hls.destroy(); } catch {} cam.hls = null; }
+      if (cam.stallWatchdog) { clearInterval(cam.stallWatchdog); cam.stallWatchdog = null; }
+      cam.transport = 'webrtc';
+      console.log(`[${cam.cameraName}] upgraded HLS → WebRTC`);
+    } catch {
+      teardownWebRTC(cam);
+      schedulePromote(cam, hlsUrl, pathName);
+    }
+  }, PROMOTE_DELAY_MS);
+}
+
+async function startStream(cam, hlsUrl, pathName) {
+  if (cam.removed) return;
+  clearReconnectTimers(cam);
+  teardownTransports(cam);
+  cam.transport = null;
+
+  // 1. WebRTC
+  if (window.RTCPeerConnection && pathName) {
+    try {
+      await startWebRTC(cam, pathName);
+      cam.transport = 'webrtc';
+      console.log(`[${cam.cameraName}] using WebRTC`);
+      return;
+    } catch (err) {
+      console.warn(`[${cam.cameraName}] WebRTC unavailable (${err.message})`);
+      teardownWebRTC(cam);
+    }
+  }
+
+  // 2. HLS — only attach if the manifest is actually there, to avoid hls.js
+  // spinning on 404s when there's no publisher.
+  if (await probeManifest(hlsUrl)) {
+    startHLS(cam, hlsUrl);
+    cam.transport = 'hls';
+    console.log(`[${cam.cameraName}] using HLS`);
+    schedulePromote(cam, hlsUrl, pathName);
+    return;
+  }
+
+  // 3. Nothing available — keep retrying quietly.
+  console.log(`[${cam.cameraName}] no stream yet; retrying in ${RECONNECT_DELAY_MS / 1000}s`);
+  scheduleReconnect(cam, hlsUrl, pathName);
+}
+
+async function startWebRTC(cam, pathName) {
+  const url = `${WEBRTC_BASE}/${pathName}/whep`;
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  });
+  cam.pc = pc;
+
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
+  const trackPromise = new Promise((resolve) => {
+    pc.ontrack = (ev) => {
+      if (ev.streams && ev.streams[0]) {
+        cam.video.srcObject = ev.streams[0];
+        resolve();
+      }
+    };
+  });
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  // Wait for ICE gathering with a hard cap so failure is fast.
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    const onChange = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', onChange);
+        resolve();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', onChange);
+    setTimeout(resolve, 1500);
+  });
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/sdp' },
+    body: pc.localDescription.sdp,
+  });
+  if (!r.ok) throw new Error(`WHEP HTTP ${r.status}`);
+  const answer = await r.text();
+  await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+
+  // If the connection drops mid-stream, kick the unified retry loop.
+  pc.addEventListener('iceconnectionstatechange', () => {
+    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+      console.warn(`[${cam.cameraName}] WebRTC ICE ${pc.iceConnectionState} — reconnecting`);
+      scheduleReconnect(cam, cam.hlsUrl, cam.pathName, 1000);
+    }
+  });
+
+  // Wait until a track actually arrives, otherwise treat as failure.
+  await Promise.race([
+    trackPromise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('no track within 4s')), 4000)),
+  ]);
+}
+
+function teardownWebRTC(cam) {
+  if (cam.pc) { try { cam.pc.close(); } catch {} cam.pc = null; }
+  if (cam.video) cam.video.srcObject = null;
+}
+
+function startHLS(cam, hlsUrl) {
+  const video = cam.video;
+  const src = hlsUrl + 'index.m3u8';
+  if (window.Hls && Hls.isSupported()) {
+    const hls = new Hls({
+      lowLatencyMode: true, enableWorker: true,
+      backBufferLength: 0, maxBufferLength: 4, maxMaxBufferLength: 8,
+      liveSyncDuration: 0.5, liveMaxLatencyDuration: 2,
+      liveDurationInfinity: true, maxLiveSyncPlaybackRate: 2.0,
+      manifestLoadingMaxRetry: 10,
+    });
+    hls.loadSource(src);
+    hls.attachMedia(video);
+    cam.hls = hls;
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      if (!data.fatal) return;
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+        return;
+      }
+      // Network or other fatal: punt to the unified reconnect flow.
+      // probeManifest() will gate when we re-attach hls.js, avoiding 404 spam.
+      console.warn(`[${cam.cameraName}] HLS fatal (${data.type}); reconnecting`);
+      scheduleReconnect(cam, cam.hlsUrl, cam.pathName, 2000);
+    });
+    let lastT = 0, stalled = 0;
+    cam.stallWatchdog = setInterval(() => {
+      if (video.paused || video.ended) return;
+      if (video.currentTime === lastT) {
+        stalled += 1;
+        if (stalled >= 4 && hls.liveSyncPosition != null) {
+          video.currentTime = hls.liveSyncPosition;
+          video.play().catch(() => {});
+          stalled = 0;
+        }
+      } else { stalled = 0; lastT = video.currentTime; }
+    }, 1000);
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = src;
+  }
+}
+
 function setTileStatus(cam, state) {
   cam.state = state;
   cam.statusPill.classList.remove('live', 'connecting', 'offline');
@@ -246,19 +418,44 @@ function setTileStatus(cam, state) {
   refreshCameraStatus();
 }
 
-function updateLatency(cam) {
+async function updateLatency(cam) {
   if (!cam.latencyEl) return;
-  if (cam.state !== 'live' || !cam.hls || typeof cam.hls.latency !== 'number' || !isFinite(cam.hls.latency)) {
+  cam.latencyEl.classList.remove('warn', 'bad');
+
+  if (cam.state !== 'live') {
     cam.latencyEl.textContent = '';
     return;
   }
-  const s = cam.hls.latency;
-  cam.latencyEl.textContent = s < 1 ? `${Math.round(s * 1000)} ms` : `${s.toFixed(1)} s`;
 
-  // Color hint: green <2s, amber 2-5s, red >5s
-  cam.latencyEl.classList.remove('warn', 'bad');
-  if (s > 5) cam.latencyEl.classList.add('bad');
-  else if (s > 2) cam.latencyEl.classList.add('warn');
+  if (cam.transport === 'webrtc' && cam.pc) {
+    let rtt = null, jitter = null;
+    try {
+      const stats = await cam.pc.getStats();
+      stats.forEach((report) => {
+        if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.currentRoundTripTime != null) {
+          rtt = report.currentRoundTripTime;
+        } else if (report.type === 'inbound-rtp' && report.kind === 'video' && report.jitter != null) {
+          jitter = report.jitter;
+        }
+      });
+    } catch { /* ignore */ }
+    if (rtt == null) { cam.latencyEl.textContent = 'RTC · —'; return; }
+    const ms = Math.round(rtt * 1000);
+    cam.latencyEl.textContent = `RTC · ${ms} ms`;
+    if (ms > 800) cam.latencyEl.classList.add('bad');
+    else if (ms > 300) cam.latencyEl.classList.add('warn');
+    return;
+  }
+
+  if (cam.transport === 'hls' && cam.hls && typeof cam.hls.latency === 'number' && isFinite(cam.hls.latency)) {
+    const s = cam.hls.latency;
+    cam.latencyEl.textContent = s < 1 ? `HLS · ${Math.round(s * 1000)} ms` : `HLS · ${s.toFixed(1)} s`;
+    if (s > 5) cam.latencyEl.classList.add('bad');
+    else if (s > 2) cam.latencyEl.classList.add('warn');
+    return;
+  }
+
+  cam.latencyEl.textContent = '';
 }
 
 function resizeCanvas(cam) {
@@ -286,6 +483,10 @@ function drawLabel(ctx, x, y, text, color, height = 18) {
 }
 function drawDetections(cam) {
   const { canvas, lastDetections, lastIncidents, tile } = cam;
+  // Self-heal: if the canvas hasn't been sized yet (e.g., WebRTC track arrived
+  // after our initial sizing pass), size it now before we try to draw.
+  if (!canvas.width || !canvas.height) resizeCanvas(cam);
+  if (!canvas.width || !canvas.height) return;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -410,12 +611,14 @@ async function addCamera({ cameraName, rtspUrl }) {
 async function removeCamera(streamId) {
   const cam = cameras.get(streamId);
   if (!cam) return;
+  cam.removed = true;
+  clearReconnectTimers(cam);
   await authedFetch(`${API}/camera/${streamId}`, { method: 'DELETE' });
-  if (cam.hls) cam.hls.destroy();
+  teardownTransports(cam);
+  if (cam.resizeObserver) { cam.resizeObserver.disconnect(); cam.resizeObserver = null; }
   if (cam.clearTimer) clearInterval(cam.clearTimer);
   if (cam.tsTimer) clearInterval(cam.tsTimer);
   if (cam.latencyTimer) clearInterval(cam.latencyTimer);
-  if (cam.stallWatchdog) clearInterval(cam.stallWatchdog);
   cam.tile.remove();
   cameras.delete(streamId);
   refreshCameraStatus();
