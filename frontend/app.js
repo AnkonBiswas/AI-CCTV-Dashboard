@@ -75,6 +75,23 @@ const DETECTION_COLORS = {
   incident:   '#ef4444',
 };
 
+// Box color when a recognized face has an enrollment category. Falls back to
+// the generic "recognized" green when type is missing or 'standard'.
+const PERSON_TYPE_COLORS = {
+  threat:   '#ef4444',
+  vip:      '#f59e0b',
+  staff:    '#3b82f6',
+  visitor:  '#a1a1aa',
+  standard: '#10b981',
+};
+
+function colorForDetection(d) {
+  if (d.name) {
+    return PERSON_TYPE_COLORS[d.personType] || DETECTION_COLORS.recognized;
+  }
+  return d.label === 'person' ? DETECTION_COLORS.person : DETECTION_COLORS.face;
+}
+
 function fmtTime(iso) {
   const d = new Date(iso);
   const now = new Date();
@@ -522,10 +539,15 @@ function drawDetections(cam) {
   for (const d of lastDetections) {
     const x = d.x * canvas.width, y = d.y * canvas.height;
     const w = d.w * canvas.width, h = d.h * canvas.height;
-    const color = d.name ? DETECTION_COLORS.recognized
-      : d.label === 'person' ? DETECTION_COLORS.person : DETECTION_COLORS.face;
-    drawBox(ctx, x, y, w, h, color);
-    const label = `${d.name || d.label} · ${Math.round(d.confidence * 100)}%`;
+    const color = colorForDetection(d);
+    // Threats get a thicker, more attention-grabbing border.
+    if (d.personType === 'threat') ctx.lineWidth = 3; else ctx.lineWidth = 1.5;
+    ctx.strokeStyle = color;
+    ctx.strokeRect(x, y, w, h);
+    const tag = d.name && d.personType && d.personType !== 'standard'
+      ? `${d.name} · ${d.personType}`
+      : (d.name || d.label);
+    const label = `${tag} · ${Math.round(d.confidence * 100)}%`;
     drawLabel(ctx, x, y, label, color);
   }
   for (const inc of lastIncidents) {
@@ -949,26 +971,145 @@ async function refreshCamerasTable() {
 }
 
 // ── Enrollments page ─────────────────────────────────────
+const PERSON_TYPES = [
+  { value: 'standard', label: 'Standard' },
+  { value: 'staff',    label: 'Staff'    },
+  { value: 'vip',      label: 'VIP'      },
+  { value: 'visitor',  label: 'Visitor'  },
+  { value: 'threat',   label: 'Threat'   },
+];
+const PERSON_TYPE_LABEL = Object.fromEntries(PERSON_TYPES.map((t) => [t.value, t.label]));
+
 async function refreshEnrollments() {
   const ul = document.getElementById('enrollments');
   if (!ul) return;
   const list = await (await authedFetch(`${API}/enrollments`)).json();
   ul.innerHTML = '';
-  for (const { name } of list) {
-    const li = document.createElement('li');
-    const img = document.createElement('img');
-    img.src = `${API}/enrollment/${encodeURIComponent(name)}/image?token=${encodeURIComponent(token)}`;
-    const span = document.createElement('span');
-    span.textContent = name.replace(/_/g, ' ');
-    const btn = document.createElement('button');
-    btn.textContent = 'Remove';
-    btn.addEventListener('click', async () => {
-      await authedFetch(`${API}/enrollment/${encodeURIComponent(name)}`, { method: 'DELETE' });
-      refreshEnrollments();
-    });
-    li.append(img, span, btn);
-    ul.appendChild(li);
+  if (list.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'enroll-empty';
+    empty.textContent = 'No people enrolled yet. Add a person to enable face recognition.';
+    ul.appendChild(empty);
+    return;
   }
+  for (const p of list) {
+    ul.appendChild(buildEnrollmentCard(p));
+  }
+}
+
+function buildEnrollmentCard(p) {
+  const li = document.createElement('li');
+  li.className = 'enroll-card';
+  const niceName = p.name.replace(/_/g, ' ');
+
+  const img = document.createElement('img');
+  img.src = `${API}/enrollment/${encodeURIComponent(p.name)}/image?token=${encodeURIComponent(token)}`;
+  img.alt = niceName;
+
+  const meta = document.createElement('div');
+  meta.className = 'enroll-meta';
+  const nameEl = document.createElement('div');
+  nameEl.className = 'enroll-name';
+  nameEl.textContent = niceName;
+  const sub = document.createElement('div');
+  sub.className = 'enroll-sub';
+  const typeBadge = document.createElement('span');
+  typeBadge.className = `type-badge type-${p.type}`;
+  typeBadge.textContent = PERSON_TYPE_LABEL[p.type] || p.type;
+  const photos = document.createElement('span');
+  photos.className = 'enroll-photo-count';
+  photos.textContent = `${p.photoCount} photo${p.photoCount === 1 ? '' : 's'}`;
+  sub.append(typeBadge, photos);
+  meta.append(nameEl, sub);
+
+  const actions = document.createElement('div');
+  actions.className = 'enroll-actions';
+  const editBtn = document.createElement('button');
+  editBtn.className = 'enroll-action';
+  editBtn.title = 'Edit category';
+  editBtn.textContent = 'Edit';
+  editBtn.addEventListener('click', () => openEditEnrollment(p));
+  const addBtn = document.createElement('button');
+  addBtn.className = 'enroll-action';
+  addBtn.title = 'Add more photos';
+  addBtn.textContent = '+ Photos';
+  addBtn.addEventListener('click', () => openAddPhotos(p));
+  const delBtn = document.createElement('button');
+  delBtn.className = 'enroll-action danger';
+  delBtn.title = 'Remove person';
+  delBtn.textContent = 'Remove';
+  delBtn.addEventListener('click', async () => {
+    if (!confirm(`Remove ${niceName} and all photos?`)) return;
+    await authedFetch(`${API}/enrollment/${encodeURIComponent(p.name)}`, { method: 'DELETE' });
+    refreshEnrollments();
+  });
+  actions.append(editBtn, addBtn, delBtn);
+
+  li.append(img, meta, actions);
+  return li;
+}
+
+// ── Add / Edit Person modal flows ────────────────────────
+let enrollMode = 'add';   // 'add' | 'add-photos' | 'edit-type'
+let enrollTarget = null;  // existing enrollment object when editing
+
+function openAddPerson() {
+  enrollMode = 'add';
+  enrollTarget = null;
+  const form = document.getElementById('enroll-form');
+  form.reset();
+  form.elements.name.disabled = false;
+  document.getElementById('enroll-type').value = 'standard';
+  document.getElementById('person-modal-title').textContent = 'Add person';
+  document.getElementById('person-modal-desc').textContent =
+    'Upload one or more clear front-facing photos. Multiple photos per person significantly improve recognition.';
+  document.getElementById('enroll-submit').textContent = 'Enroll';
+  document.getElementById('enroll-file-list').innerHTML = '';
+  form.elements.images.required = true;
+  openModal('add-person-modal');
+}
+
+function openEditEnrollment(p) {
+  enrollMode = 'edit-type';
+  enrollTarget = p;
+  const form = document.getElementById('enroll-form');
+  form.reset();
+  form.elements.name.value = p.name.replace(/_/g, ' ');
+  form.elements.name.disabled = true;
+  document.getElementById('enroll-type').value = p.type || 'standard';
+  document.getElementById('person-modal-title').textContent = 'Edit person';
+  document.getElementById('person-modal-desc').textContent =
+    'Change the category. Photos are unchanged — use “+ Photos” on the card to add more.';
+  document.getElementById('enroll-submit').textContent = 'Save';
+  document.getElementById('enroll-file-list').innerHTML = '';
+  form.elements.images.required = false;
+  openModal('add-person-modal');
+}
+
+function openAddPhotos(p) {
+  enrollMode = 'add-photos';
+  enrollTarget = p;
+  const form = document.getElementById('enroll-form');
+  form.reset();
+  form.elements.name.value = p.name.replace(/_/g, ' ');
+  form.elements.name.disabled = true;
+  document.getElementById('enroll-type').value = p.type || 'standard';
+  document.getElementById('person-modal-title').textContent = `Add photos — ${p.name.replace(/_/g, ' ')}`;
+  document.getElementById('person-modal-desc').textContent =
+    'Upload more reference photos. More photos under varied lighting/angles = stronger recognition.';
+  document.getElementById('enroll-submit').textContent = 'Add photos';
+  document.getElementById('enroll-file-list').innerHTML = '';
+  form.elements.images.required = true;
+  openModal('add-person-modal');
+}
+
+function readFilesAsDataURLs(fileList) {
+  return Promise.all([...fileList].map((f) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(f);
+  })));
 }
 
 // ── Events / Alerts page ─────────────────────────────────
@@ -1191,7 +1332,7 @@ document.querySelectorAll('.modal-overlay').forEach((m) => {
 
 document.getElementById('add-camera-btn')?.addEventListener('click', () => openModal('add-camera-modal'));
 document.getElementById('add-camera-btn-2')?.addEventListener('click', () => openModal('add-camera-modal'));
-document.getElementById('add-person-btn')?.addEventListener('click', () => openModal('add-person-modal'));
+document.getElementById('add-person-btn')?.addEventListener('click', openAddPerson);
 
 document.getElementById('add-camera-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -1203,21 +1344,62 @@ document.getElementById('add-camera-form').addEventListener('submit', async (e) 
 
 document.getElementById('enroll-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const fd = new FormData(e.target);
-  const file = fd.get('image');
-  const reader = new FileReader();
-  reader.onload = async () => {
-    const r = await authedFetch(`${API}/enroll`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: fd.get('name'), imageBase64: reader.result }),
-    });
-    if (!r.ok) { alert(`Enroll failed: ${await r.text()}`); return; }
-    e.target.reset();
+  const form = e.target;
+  const fd = new FormData(form);
+  const name = fd.get('name');
+  const type = fd.get('type') || 'standard';
+  const fileInput = form.elements.images;
+  const files = fileInput?.files || [];
+  const submit = document.getElementById('enroll-submit');
+
+  submit.disabled = true;
+  const oldText = submit.textContent;
+  submit.textContent = 'Working…';
+
+  try {
+    if (enrollMode === 'edit-type') {
+      // Just update the category — no photos involved.
+      const r = await authedFetch(`${API}/enrollment/${encodeURIComponent(enrollTarget.name)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type }),
+      });
+      if (!r.ok) { alert(`Update failed: ${await r.text()}`); return; }
+    } else {
+      // Add new person OR add more photos to existing — both go through /enroll.
+      if (files.length === 0) {
+        alert('Pick at least one photo.');
+        return;
+      }
+      const imagesBase64 = await readFilesAsDataURLs(files);
+      const targetName = enrollMode === 'add-photos' ? enrollTarget.name : name;
+      const body = { name: targetName, imagesBase64 };
+      if (enrollMode === 'add') body.type = type;
+      const r = await authedFetch(`${API}/enroll`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { alert(`Enroll failed: ${await r.text()}`); return; }
+    }
     closeModal('add-person-modal');
     refreshEnrollments();
-  };
-  reader.readAsDataURL(file);
+  } finally {
+    submit.disabled = false;
+    submit.textContent = oldText;
+  }
+});
+
+// Live preview of the picked files in the modal.
+document.querySelector('#enroll-form input[name="images"]')?.addEventListener('change', (e) => {
+  const list = document.getElementById('enroll-file-list');
+  list.innerHTML = '';
+  for (const f of e.target.files) {
+    const chip = document.createElement('span');
+    chip.className = 'enroll-file-chip';
+    chip.textContent = f.name;
+    list.appendChild(chip);
+  }
 });
 
 // ── Top bar wiring ───────────────────────────────────────

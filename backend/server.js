@@ -44,6 +44,36 @@ function emitToUser(userId, event, payload) {
   io.to(`user:${userId}`).emit(event, payload);
 }
 
+// ── Per-user enrollment type cache (name → type) ─────────────
+// Loaded lazily on first detection for that user; busted on every enroll/
+// edit/delete so detection events always carry a fresh personType.
+const enrollmentTypeCache = new Map(); // userId -> Map<name, type>
+
+async function getEnrollmentTypes(userId) {
+  let map = enrollmentTypeCache.get(userId);
+  if (map) return map;
+  map = new Map();
+  try {
+    const [rows] = await db.getPool().query(
+      'SELECT name, type FROM enrollments WHERE user_id = ?', [userId],
+    );
+    for (const r of rows) map.set(r.name, r.type);
+  } catch (err) {
+    console.error('[enrollment-types] cache load failed:', err.message);
+  }
+  enrollmentTypeCache.set(userId, map);
+  return map;
+}
+
+function invalidateEnrollmentTypes(userId) { enrollmentTypeCache.delete(userId); }
+
+function augmentDetections(types, detections) {
+  if (!Array.isArray(detections)) return detections;
+  return detections.map((d) =>
+    d.name && types.has(d.name) ? { ...d, personType: types.get(d.name) } : d,
+  );
+}
+
 // ── Per-user feature cache (in-memory mirror of `features` table) ─
 const featureCache = new Map(); // userId -> Map<name, boolean>
 
@@ -133,10 +163,15 @@ function startMasterWorker() {
         if (msg.type === 'detections') {
           const stream = activeStreams.get(msg.streamId);
           if (stream) {
-            emitToUser(stream.userId, 'face_detections', { streamId: msg.streamId, detections: msg.detections });
-            if (msg.incidents && msg.incidents.length > 0) {
-              emitToUser(stream.userId, 'incident_detections', { streamId: msg.streamId, incidents: msg.incidents });
-            }
+            // Look up enrollment types so the frontend can color recognized
+            // faces by category (threat/vip/staff/...). Cached per user.
+            getEnrollmentTypes(stream.userId).then((types) => {
+              const detections = augmentDetections(types, msg.detections);
+              emitToUser(stream.userId, 'face_detections', { streamId: msg.streamId, detections });
+              if (msg.incidents && msg.incidents.length > 0) {
+                emitToUser(stream.userId, 'incident_detections', { streamId: msg.streamId, incidents: msg.incidents });
+              }
+            }).catch((err) => console.error('[detections] augment failed:', err.message));
           }
           persistIncidents(msg.streamId, msg.detections, msg.incidents).catch(() => {});
         } else {
@@ -331,52 +366,175 @@ function userDir(userId) {
   return dir;
 }
 
-app.post('/enroll', (req, res) => {
+// Person types we support. Anything else falls back to 'standard' on write.
+const ENROLLMENT_TYPES = new Set(['standard', 'staff', 'vip', 'visitor', 'threat']);
+const normalizeType = (t) => (ENROLLMENT_TYPES.has(t) ? t : 'standard');
+
+function nextEnrollmentSlot(dir, safe) {
+  let i = 1;
+  while (true) {
+    const taken = ['jpg', 'jpeg', 'png'].some((e) =>
+      fs.existsSync(path.join(dir, `${safe}_${i}.${e}`)),
+    );
+    if (!taken) return i;
+    i++;
+  }
+}
+
+function writeOnePhoto(dir, safe, base64) {
+  const m = base64.match(/^data:image\/(\w+);base64,(.*)$/);
+  const ext = m ? (m[1].toLowerCase() === 'jpeg' ? 'jpg' : m[1].toLowerCase()) : 'jpg';
+  const data = m ? m[2] : base64;
+  if (!['jpg', 'jpeg', 'png'].includes(ext)) {
+    throw new Error(`unsupported image type "${ext}" — must be jpg or png`);
+  }
+  const idx = nextEnrollmentSlot(dir, safe);
+  const filePath = path.join(dir, `${safe}_${idx}.${ext}`);
+  fs.writeFileSync(filePath, Buffer.from(data, 'base64'));
+  return idx;
+}
+
+// POST /enroll
+//   body: { name, type?, imagesBase64?: string[], imageBase64?: string }   <- legacy single
+// Creates the person if missing, or appends photos to an existing person.
+app.post('/enroll', async (req, res) => {
   const userId = req.user.uid;
-  const { name, imageBase64 } = req.body || {};
-  if (!name || !imageBase64) {
-    return res.status(400).json({ error: 'name and imageBase64 required' });
+  const { name, type, imageBase64, imagesBase64 } = req.body || {};
+  const images = Array.isArray(imagesBase64) ? imagesBase64
+               : imageBase64 ? [imageBase64]
+               : [];
+  if (!name || images.length === 0) {
+    return res.status(400).json({ error: 'name and at least one image required' });
   }
   const safe = sanitizeName(name);
   if (!safe) return res.status(400).json({ error: 'invalid name' });
 
   const dir = userDir(userId);
-  const m = imageBase64.match(/^data:image\/(\w+);base64,(.*)$/);
-  const ext = m ? (m[1].toLowerCase() === 'jpeg' ? 'jpg' : m[1].toLowerCase()) : 'jpg';
-  const data = m ? m[2] : imageBase64;
-
-  let index = 1;
-  let filePath;
-  while (true) {
-    const exists = ['jpg', 'jpeg', 'png'].some((e) =>
-      fs.existsSync(path.join(dir, `${safe}_${index}.${e}`)),
-    );
-    if (!exists) { filePath = path.join(dir, `${safe}_${index}.${ext}`); break; }
-    index++;
-  }
-
+  const written = [];
   try {
-    fs.writeFileSync(filePath, Buffer.from(data, 'base64'));
+    for (const img of images) {
+      written.push(writeOnePhoto(dir, safe, img));
+    }
   } catch (err) {
+    // Best-effort cleanup of any photos already written this call.
+    for (const idx of written) {
+      for (const ext of ['jpg', 'jpeg', 'png']) {
+        const p = path.join(dir, `${safe}_${idx}.${ext}`);
+        if (fs.existsSync(p)) try { fs.unlinkSync(p); } catch {}
+      }
+    }
     return res.status(500).json({ error: `save failed: ${err.message}` });
   }
 
+  // Upsert the metadata row. Type defaults to 'standard' on first creation.
+  try {
+    await db.getPool().query(
+      `INSERT INTO enrollments (user_id, name, type)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE type = IF(VALUES(type) = 'standard' AND type <> 'standard', type, VALUES(type))`,
+      [userId, safe, normalizeType(type)],
+    );
+  } catch (err) {
+    console.error('[enroll] DB upsert failed:', err.message);
+  }
+
+  invalidateEnrollmentTypes(userId);
   fs.utimesSync(dir, new Date(), new Date());
-  res.json({ name: safe, index });
+  res.json({ name: safe, photosAdded: written.length, slots: written });
 });
 
-app.get('/enrollments', (req, res) => {
+// GET /enrollments
+// Returns one entry per enrolled person with type + photo count. Auto-heals
+// metadata: if photos exist on disk but no DB row, we lazy-insert one with
+// the default 'standard' type so legacy enrollments show up correctly.
+app.get('/enrollments', async (req, res) => {
   const userId = req.user.uid;
   const dir = userDir(userId);
+  let files = [];
   try {
-    const files = fs.readdirSync(dir).filter((f) => /\.(jpg|jpeg|png)$/i.test(f));
-    res.json(files.map((f) => ({ name: path.parse(f).name, file: f })));
-  } catch {
-    res.json([]);
+    files = fs.readdirSync(dir).filter((f) => /\.(jpg|jpeg|png)$/i.test(f));
+  } catch { /* dir missing — empty list */ }
+
+  // Group photos by base name (strip _<idx> suffix).
+  const photosByName = new Map();
+  for (const f of files) {
+    const stem = path.parse(f).name;
+    const base = stem.replace(/_\d+$/, '');
+    if (!photosByName.has(base)) photosByName.set(base, []);
+    photosByName.get(base).push(f);
+  }
+
+  let metaRows = [];
+  try {
+    const [r] = await db.getPool().query(
+      'SELECT name, type, notes, created_at, updated_at FROM enrollments WHERE user_id = ?',
+      [userId],
+    );
+    metaRows = r;
+  } catch (err) {
+    console.error('[enrollments] DB read failed:', err.message);
+  }
+  const metaByName = new Map(metaRows.map((m) => [m.name, m]));
+
+  // Lazy-create rows for filesystem-only enrollments.
+  const missing = [...photosByName.keys()].filter((n) => !metaByName.has(n));
+  if (missing.length) {
+    try {
+      const values = missing.map((n) => [userId, n, 'standard']);
+      await db.getPool().query(
+        'INSERT IGNORE INTO enrollments (user_id, name, type) VALUES ?',
+        [values],
+      );
+      for (const n of missing) metaByName.set(n, { name: n, type: 'standard' });
+    } catch { /* race or readonly — tolerate */ }
+  }
+
+  const out = [...photosByName.entries()].map(([name, fs_]) => {
+    const m = metaByName.get(name) || {};
+    return {
+      name,
+      type: m.type || 'standard',
+      notes: m.notes || null,
+      photoCount: fs_.length,
+      file: fs_[0], // primary photo, used for the avatar
+    };
+  });
+  res.json(out.sort((a, b) => a.name.localeCompare(b.name)));
+});
+
+// PUT /enrollment/:name   body: { type?, notes? }
+app.put('/enrollment/:name', async (req, res) => {
+  const userId = req.user.uid;
+  const safe = sanitizeName(req.params.name);
+  if (!safe) return res.status(400).json({ error: 'invalid name' });
+
+  const update = {};
+  if (typeof req.body?.type === 'string')  update.type  = normalizeType(req.body.type);
+  if (typeof req.body?.notes === 'string') update.notes = req.body.notes.slice(0, 500);
+  if (!Object.keys(update).length) {
+    return res.status(400).json({ error: 'nothing to update (type or notes)' });
+  }
+
+  const cols = Object.keys(update);
+  const vals = Object.values(update);
+  const setSql = cols.map((k) => `${k} = ?`).join(', ');
+  try {
+    await db.getPool().query(
+      `INSERT INTO enrollments (user_id, name, ${cols.join(', ')})
+       VALUES (?, ?, ${cols.map(() => '?').join(', ')})
+       ON DUPLICATE KEY UPDATE ${setSql}`,
+      [userId, safe, ...vals, ...vals],
+    );
+    invalidateEnrollmentTypes(userId);
+    // Bump dir mtime so the AI worker reloads the centroids+types map.
+    try { fs.utimesSync(userDir(userId), new Date(), new Date()); } catch {}
+    res.json({ name: safe, ...update });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.delete('/enrollment/:name', (req, res) => {
+app.delete('/enrollment/:name', async (req, res) => {
   const userId = req.user.uid;
   const dir = userDir(userId);
   const safe = sanitizeName(req.params.name);
@@ -388,6 +546,12 @@ app.delete('/enrollment/:name', (req, res) => {
     fs.unlinkSync(path.join(dir, f));
     removed++;
   }
+  try {
+    await db.getPool().query('DELETE FROM enrollments WHERE user_id = ? AND name = ?', [userId, safe]);
+  } catch (err) {
+    console.error('[enrollment delete] DB failed:', err.message);
+  }
+  invalidateEnrollmentTypes(userId);
   if (removed) fs.utimesSync(dir, new Date(), new Date());
   res.json({ removed });
 });

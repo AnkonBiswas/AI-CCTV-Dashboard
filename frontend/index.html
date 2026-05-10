@@ -419,25 +419,39 @@
     </div>
   </div>
 
-  <!-- ── Add Person modal ─────────────────────────────────── -->
+  <!-- ── Add / Edit Person modal ─────────────────────────────────── -->
   <div id="add-person-modal" class="modal-overlay" style="display:none">
     <div class="modal-box">
       <div class="modal-header">
         <span class="modal-icon"><svg><use href="#i-users"/></svg></span>
-        <h2>Add person</h2>
+        <h2 id="person-modal-title">Add person</h2>
         <button class="modal-close" data-close="add-person-modal"><svg style="width:14px;height:14px"><use href="#i-x"/></svg></button>
       </div>
-      <p class="modal-desc">Upload a clear front-facing photo. Multiple photos per person improve recognition.</p>
+      <p class="modal-desc" id="person-modal-desc">Upload one or more clear front-facing photos. Multiple photos per person significantly improve recognition.</p>
       <form id="enroll-form">
         <div class="input-group">
           <label>Name</label>
           <input name="name" placeholder="Jane Doe" required>
         </div>
+        <div class="input-group">
+          <label>Category</label>
+          <div class="select-wrap" style="width:100%">
+            <svg><use href="#i-users"/></svg>
+            <select name="type" id="enroll-type" style="width:100%">
+              <option value="standard">Standard</option>
+              <option value="staff">Staff</option>
+              <option value="vip">VIP</option>
+              <option value="visitor">Visitor</option>
+              <option value="threat">Threat</option>
+            </select>
+          </div>
+        </div>
         <label class="file-input">
-          <span>Choose photo</span>
-          <input name="image" type="file" accept="image/*" required>
+          <span id="enroll-file-label">Choose photos (you can pick several)</span>
+          <input name="images" type="file" accept="image/*" multiple>
         </label>
-        <button type="submit" class="btn-primary" style="width:100%">Enroll</button>
+        <div id="enroll-file-list" class="enroll-file-list"></div>
+        <button type="submit" class="btn-primary" id="enroll-submit" style="width:100%">Enroll</button>
       </form>
     </div>
   </div>

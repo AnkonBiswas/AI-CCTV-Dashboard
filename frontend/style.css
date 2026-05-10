@@ -961,40 +961,107 @@ button { font-family: inherit; }
 .enrollments-grid {
   list-style: none;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 12px;
 }
-.enrollments-grid li {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
+.enrollments-grid .enroll-empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  padding: 24px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.enroll-card {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 12px;
+  padding: 12px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
 }
-.enrollments-grid img {
-  width: 36px; height: 36px; border-radius: 50%; object-fit: cover;
+.enroll-card img {
+  grid-row: 1 / 3;
+  width: 56px; height: 56px; border-radius: 12px;
+  object-fit: cover;
   border: 1px solid var(--border);
 }
-.enrollments-grid span {
-  flex: 1;
-  font-size: 13px;
+.enroll-meta { min-width: 0; }
+.enroll-name {
+  font-size: 14px;
+  font-weight: 600;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.enrollments-grid button {
+.enroll-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.enroll-photo-count {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.enroll-actions {
+  grid-column: 2;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.enroll-action {
   background: transparent;
   border: 1px solid var(--border);
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-size: 11px;
-  padding: 4px 8px;
+  padding: 4px 9px;
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
-.enrollments-grid button:hover { color: var(--danger); border-color: rgba(239,68,68,0.3); }
+.enroll-action:hover { color: var(--text); border-color: var(--border-strong); }
+.enroll-action.danger:hover { color: var(--danger); border-color: rgba(239,68,68,0.4); background: rgba(239,68,68,0.05); }
+
+/* ── Type badges (also used on detection overlays) ──── */
+.type-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.type-badge.type-threat   { background: rgba(239,68,68,0.14);  color: var(--danger);  }
+.type-badge.type-vip      { background: rgba(245,158,11,0.14); color: var(--warning); }
+.type-badge.type-staff    { background: rgba(59,130,246,0.14); color: var(--accent);  }
+.type-badge.type-visitor  { background: rgba(161,161,170,0.18); color: var(--text-secondary); }
+.type-badge.type-standard { background: rgba(16,185,129,0.14); color: var(--success); }
+
+/* File-chip preview inside Add Person modal */
+.enroll-file-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.enroll-file-list:empty { display: none; }
+.enroll-file-chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  padding: 3px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ── Feature toggles ──────────────────────────────────── */
 .feature-list {

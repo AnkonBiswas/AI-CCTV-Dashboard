@@ -60,6 +60,25 @@ CREATE TABLE IF NOT EXISTS cameras (
   INDEX idx_user (user_id)
 ) ENGINE=InnoDB;
 
+-- ── enrollments ─────────────────────────────────────────────────────────
+-- Per-person metadata. The actual face images live on disk in
+-- face-ai/enrollments/<user_id>/<name>_<idx>.{jpg,png}; this table tracks
+-- categorization (threat/vip/staff/visitor/standard) and free-form notes.
+-- Composite unique on (user_id, name) so the same name can exist under
+-- different accounts independently.
+CREATE TABLE IF NOT EXISTS enrollments (
+  id          INT          NOT NULL AUTO_INCREMENT,
+  user_id     INT          NOT NULL,
+  name        VARCHAR(255) NOT NULL,
+  type        VARCHAR(32)  NOT NULL DEFAULT 'standard',
+  notes       VARCHAR(500),
+  created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uniq_user_enroll (user_id, name),
+  INDEX idx_user (user_id)
+) ENGINE=InnoDB;
+
 -- ── incidents ───────────────────────────────────────────────────────────
 -- Detection log. Written by server.js#persistIncidents() with a per
 -- (stream_id, type, name) throttle so a steady fire doesn't flood the table.

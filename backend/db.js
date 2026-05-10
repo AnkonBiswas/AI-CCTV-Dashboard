@@ -72,6 +72,25 @@ async function init() {
     ) ENGINE=InnoDB
   `);
 
+  // ── enrollments: per-person metadata (type, notes) ────────
+  // The actual face images live on disk in face-ai/enrollments/<user_id>/.
+  // This table tracks the categorization (threat/vip/staff/...) and any notes
+  // so the dashboard and AI worker can color-code recognized faces.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS enrollments (
+      id          INT          NOT NULL AUTO_INCREMENT,
+      user_id     INT          NOT NULL,
+      name        VARCHAR(255) NOT NULL,
+      type        VARCHAR(32)  NOT NULL DEFAULT 'standard',
+      notes       VARCHAR(500),
+      created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+      updated_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_user_enroll (user_id, name),
+      INDEX idx_user (user_id)
+    ) ENGINE=InnoDB
+  `);
+
   // ── incidents: owned by user_id ───────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS incidents (
