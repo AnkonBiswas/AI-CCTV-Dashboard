@@ -21,7 +21,23 @@ YOLO_MODEL_PATH = os.path.join(HERE, 'yolov8n.pt') # Standard nano model
 FIRE_MODEL_PATH = os.path.join(HERE, 'fire_model.pt') # Optional custom model
 
 FRAME_SKIP = 5               # Process every 5th frame to reduce CPU load
-RECOGNITION_THRESHOLD = 115
+
+# LBPH face-recognition strictness. LBPH distance is "lower is better".
+#   < 50  : very strict, near-perfect lighting/pose required (lots of "Unknown")
+#   50-70 : strict — only confident matches get a name (recommended for live cams)
+#   70-90 : moderate — relaxed enough for varied lighting; some look-alikes leak
+#   > 100 : loose — false matches between similar-looking people are common
+# Override via FACE_RECOGNITION_THRESHOLD env var without editing the file.
+RECOGNITION_THRESHOLD     = int(os.environ.get('FACE_RECOGNITION_THRESHOLD', '70'))
+
+# Faces smaller than this fraction of the (downscaled) frame area are too noisy
+# to recognize reliably. Below the cutoff we still detect the face but don't
+# attempt to identify it — better an "unknown" box than a wrong name.
+MIN_FACE_AREA_RATIO       = 0.005
+
+# Temporal stability: a name only "sticks" after the recognizer agrees on it
+# for this many consecutive processed frames. Suppresses single-frame mistakes.
+RECOGNITION_CONFIRM_FRAMES = 2
 
 def log(obj):
     sys.stdout.write(json.dumps(obj) + '\n')
@@ -147,6 +163,12 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
     # For incident heuristics (e.g. fight)
     person_history = collections.deque(maxlen=10) # Track person counts/locations
 
+    # Temporal stability for face recognition. Per-slot we track the last
+    # candidate name and a streak counter; only emit a name once the streak
+    # passes RECOGNITION_CONFIRM_FRAMES. We slot by face-box centroid bucket
+    # so different people in the frame don't share a streak.
+    name_streaks = {}  # bucket -> {'name': str, 'count': int}
+
     while not stop_event.is_set():
         if cap is None or not cap.isOpened():
             if cap: cap.release()
@@ -193,10 +215,16 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
                 result = shared_face_detector.detect(mp_img)
             if result.detections:
                 gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+                seen_buckets = set()
                 for d in result.detections:
                     bb = d.bounding_box
                     name = None
-                    if rec is not None:
+
+                    # Skip recognition for very small faces — LBPH on tiny crops
+                    # produces near-random matches.
+                    face_area_ratio = (bb.width * bb.height) / float(w * h)
+
+                    if rec is not None and face_area_ratio >= MIN_FACE_AREA_RATIO:
                         with rec.lock:
                             if rec.ready:
                                 x = max(0, bb.origin_x); y = max(0, bb.origin_y)
@@ -206,13 +234,32 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
                                     crop = cv2.resize(crop, (120, 120))
                                     label, dist = rec.recognizer.predict(crop)
                                     if dist < RECOGNITION_THRESHOLD:
-                                        name = rec.names_map.get(label)
+                                        candidate = rec.names_map.get(label)
+                                        # Temporal smoothing: bucket by face-centroid (~10% grid)
+                                        cx = (bb.origin_x + bb.width / 2) / w
+                                        cy = (bb.origin_y + bb.height / 2) / h
+                                        bucket = (round(cx * 10), round(cy * 10))
+                                        seen_buckets.add(bucket)
+                                        s = name_streaks.get(bucket)
+                                        if s and s['name'] == candidate:
+                                            s['count'] += 1
+                                        else:
+                                            name_streaks[bucket] = {'name': candidate, 'count': 1}
+                                            s = name_streaks[bucket]
+                                        if s['count'] >= RECOGNITION_CONFIRM_FRAMES:
+                                            name = candidate
                     detections.append({
                         'x': bb.origin_x / w, 'y': bb.origin_y / h,
                         'w': bb.width / w,    'h': bb.height / h,
                         'confidence': float(d.categories[0].score if d.categories else 0),
                         'label': 'face', 'name': name,
                     })
+
+                # Drop streak slots that nobody held this frame so we don't
+                # keep a stale name alive after a person leaves the scene.
+                for bucket in list(name_streaks.keys()):
+                    if bucket not in seen_buckets:
+                        del name_streaks[bucket]
         except Exception as ex:
             log({'type': 'warning', 'message': f'Face detect error: {ex}'})
 
