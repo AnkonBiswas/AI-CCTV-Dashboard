@@ -611,8 +611,31 @@ function fullscreenTile(streamId) {
   const cam = cameras.get(streamId);
   if (!cam) return;
   const wrap = cam.video.parentElement;
-  (wrap.requestFullscreen || wrap.webkitRequestFullscreen)?.call(wrap);
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  // Toggle: same wrap already fullscreen → exit; otherwise enter. Without
+  // this, clicking the button while fullscreen is a no-op (the user's
+  // "minimize doesn't work" report).
+  if (fsEl === wrap) {
+    (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+  } else {
+    (wrap.requestFullscreen || wrap.webkitRequestFullscreen)?.call(wrap);
+  }
 }
+
+// Swap each tile's button icon between expand/minimize based on the current
+// fullscreen element. Covers ESC-to-exit as well as the button click path.
+function syncTileFullscreenIcons() {
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  document.querySelectorAll('.video-wrap .fullscreen').forEach((btn) => {
+    const wrap = btn.closest('.video-wrap');
+    const isFs = wrap && wrap === fsEl;
+    const use = btn.querySelector('use');
+    if (use) use.setAttribute('href', isFs ? '#i-minimize' : '#i-fullscreen');
+    btn.title = isFs ? 'Exit fullscreen' : 'Fullscreen';
+  });
+}
+document.addEventListener('fullscreenchange', syncTileFullscreenIcons);
+document.addEventListener('webkitfullscreenchange', syncTileFullscreenIcons);
 // ── Recording (browser-side via MediaRecorder) ───────────
 const REC_MIME_CANDIDATES = [
   'video/webm;codecs=vp9,opus',

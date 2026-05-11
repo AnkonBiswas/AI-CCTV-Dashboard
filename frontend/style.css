@@ -245,6 +245,10 @@ body {
   max-width: 520px;
   margin: 0 12px;
 }
+/* Push the right-side controls (bell, help, fullscreen, user-chip) to the
+   far right of the topbar. Without this, search caps at 520px and all the
+   icons sit packed against it, leaving the right half of the topbar empty. */
+.topbar #bell-btn { margin-left: auto; }
 .search svg {
   position: absolute;
   top: 50%;
