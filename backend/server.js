@@ -816,8 +816,32 @@ app.get('/person/:name/activity', async (req, res) => {
   const safe = sanitizeName(req.params.name);
   if (!safe) return res.status(400).json({ error: 'invalid name' });
   const displayName = safe.replace(/_/g, ' ');
-  const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
-  const since = new Date(Date.now() - days * 24 * 3600 * 1000);
+  // Window: either a single calendar day (`date=YYYY-MM-DD`) or rolling
+  // `days=N`. Single-day mode is what the daywise table's "View details"
+  // button uses to drill into one row.
+  //
+  // For single-day mode we pass the bounds as plain `YYYY-MM-DD HH:MM:SS`
+  // strings — MySQL then interprets them in *its* session TZ, the same TZ
+  // that the daywise endpoint's `DATE(created_at)` GROUP BY uses. Passing
+  // JS Date objects here would round-trip through Node's local TZ via
+  // mysql2 — when MySQL's session TZ differs (the common case on a fresh
+  // install: MySQL UTC, Node local) you get an off-by-N-hours window that
+  // silently excludes the rows the user was just looking at.
+  let since, until, days = null, dateStr = null;
+  const dateMatch = String(req.query.date || '').match(/^(\d{4}-\d{2}-\d{2})$/);
+  if (dateMatch) {
+    dateStr = dateMatch[1];
+    // Compute "next day" textually so we don't introduce TZ drift in JS.
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const nextUtc = new Date(Date.UTC(y, m - 1, d + 1));
+    const nextStr = nextUtc.toISOString().slice(0, 10);
+    since = `${dateStr} 00:00:00`;
+    until = `${nextStr} 00:00:00`;
+  } else {
+    days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
+    since = new Date(Date.now() - days * 24 * 3600 * 1000);
+    until = new Date(Date.now() + 24 * 3600 * 1000); // future-safe upper bound
+  }
   const pool = db.getPool();
 
   try {
@@ -828,9 +852,11 @@ app.get('/person/:name/activity', async (req, res) => {
     if (metaRows.length === 0) return res.status(404).json({ error: 'person not found' });
     const meta = metaRows[0];
 
-    // All queries below only look at recognized face detections for this name.
-    const baseWhere = `user_id = ? AND name = ? AND type = 'face' AND created_at >= ?`;
-    const baseArgs = [userId, displayName, since];
+    // All queries below only look at recognized face detections for this name,
+    // within the chosen window. `until` is always present so the single-day
+    // and rolling-window paths share the same SQL.
+    const baseWhere = `user_id = ? AND name = ? AND type = 'face' AND created_at >= ? AND created_at < ?`;
+    const baseArgs = [userId, displayName, since, until];
 
     const [summaryRows] = await pool.query(
       `SELECT COUNT(*) AS total,
@@ -877,7 +903,8 @@ app.get('/person/:name/activity', async (req, res) => {
        FROM incidents i
        LEFT JOIN cameras c
          ON c.user_id = i.user_id AND c.camera_name = i.camera_name
-       WHERE i.user_id = ? AND i.name = ? AND i.type = 'face' AND i.created_at >= ?
+       WHERE i.user_id = ? AND i.name = ? AND i.type = 'face'
+             AND i.created_at >= ? AND i.created_at < ?
        ORDER BY i.created_at DESC LIMIT 100`,
       baseArgs,
     );
@@ -888,6 +915,7 @@ app.get('/person/:name/activity', async (req, res) => {
       type: meta.type,
       notes: meta.notes,
       days,
+      date: dateStr,
       summary: {
         total: Number(s.total || 0),
         firstSeen: s.firstSeen,
@@ -974,6 +1002,58 @@ app.get('/analytics-charts', async (req, res) => {
         day: (d.day instanceof Date) ? d.day.toISOString().slice(0, 10) : String(d.day).slice(0, 10),
         n: Number(d.n),
         alerts: Number(d.alerts || 0),
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Analytics: day-wise per-person breakdown ──────────────────
+// One row per (day, recognized person) for the requested window. Drives the
+// "Daily activity by person" table on the Analytics page (each row links into
+// the existing person-activity drill-down via "View details").
+//
+// Names live in two shapes (see /person/:name/activity for the full note):
+//   - enrollments.name uses underscores (sanitized for disk filenames)
+//   - incidents.name uses the display form with spaces (what the AI emits)
+// We return the display form for `name` and derive `nameKey` (underscored)
+// so the frontend can route into the activity page without a lookup.
+app.get('/analytics-daywise', async (req, res) => {
+  const userId = req.user.uid;
+  const days = Math.max(1, Math.min(Number(req.query.days) || 7, 90));
+  const since = new Date(Date.now() - days * 24 * 3600 * 1000);
+  const pool = db.getPool();
+  // GROUP_CONCAT default cap is 1024 chars — plenty for camera names, but a
+  // very chatty install could exceed it. Bump the session limit just in case.
+  const CAM_SEP = '|||';
+  try {
+    await pool.query('SET SESSION group_concat_max_len = 32768');
+    const [rows] = await pool.query(
+      `SELECT DATE(created_at) AS day,
+              name,
+              COUNT(*) AS n,
+              MIN(created_at) AS firstSeen,
+              MAX(created_at) AS lastSeen,
+              GROUP_CONCAT(DISTINCT IFNULL(camera_name, 'Unknown')
+                           ORDER BY camera_name SEPARATOR ?) AS cameras
+       FROM incidents
+       WHERE user_id = ? AND created_at >= ?
+             AND name IS NOT NULL AND name <> ''
+       GROUP BY day, name
+       ORDER BY day DESC, n DESC, name ASC`,
+      [CAM_SEP, userId, since],
+    );
+    res.json({
+      days,
+      rows: rows.map((r) => ({
+        day: (r.day instanceof Date) ? r.day.toISOString().slice(0, 10) : String(r.day).slice(0, 10),
+        name: r.name,
+        nameKey: String(r.name).replace(/ /g, '_'),
+        n: Number(r.n),
+        firstSeen: r.firstSeen,
+        lastSeen: r.lastSeen,
+        cameras: r.cameras ? String(r.cameras).split(CAM_SEP) : [],
       })),
     });
   } catch (err) {

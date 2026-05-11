@@ -1591,9 +1591,13 @@ function renderHorizontalBars(elId, rows, labelKey, valueKey) {
 
 // ── Person Activity (drill-down from People page) ────────
 let paCurrentName = null;
+// When set (YYYY-MM-DD), the activity page is scoped to a single calendar
+// day instead of the rolling N-day window. Cleared by the chip's × button.
+let paDateOverride = null;
 
-function openPersonActivity(p) {
+function openPersonActivity(p, opts = {}) {
   paCurrentName = p.name;
+  paDateOverride = opts.date || null;
   // Update header chrome before the fetch so the user sees something instant.
   document.getElementById('pa-name').textContent = p.name.replace(/_/g, ' ');
   document.getElementById('pa-avatar').src =
@@ -1603,17 +1607,39 @@ function openPersonActivity(p) {
   badge.textContent = PERSON_TYPE_LABEL[p.type] || p.type;
   document.getElementById('pa-notes').textContent = p.notes || '';
   document.getElementById('pa-period').value = '30';
+  syncPaDateChip();
   // Route to the page (uses the standard router but it's a hidden route).
   showRoute('person-activity');
   refreshPersonActivity();
 }
 
+// Swap between the period dropdown and the "Showing <date>" chip depending
+// on whether the page is in single-day mode.
+function syncPaDateChip() {
+  const wrap = document.getElementById('pa-period-wrap');
+  const chip = document.getElementById('pa-date-chip');
+  const label = document.getElementById('pa-date-chip-label');
+  if (!wrap || !chip || !label) return;
+  if (paDateOverride) {
+    wrap.style.display = 'none';
+    chip.style.display = '';
+    const d = new Date(`${paDateOverride}T00:00:00`);
+    label.textContent = `Showing ${Number.isNaN(d.getTime()) ? paDateOverride
+      : d.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' })}`;
+  } else {
+    wrap.style.display = '';
+    chip.style.display = 'none';
+  }
+}
+
 async function refreshPersonActivity() {
   if (!paCurrentName) return;
-  const days = Number(document.getElementById('pa-period').value || 30);
+  const params = paDateOverride
+    ? `date=${encodeURIComponent(paDateOverride)}`
+    : `days=${Number(document.getElementById('pa-period').value || 30)}`;
   let data;
   try {
-    const r = await authedFetch(`${API}/person/${encodeURIComponent(paCurrentName)}/activity?days=${days}`);
+    const r = await authedFetch(`${API}/person/${encodeURIComponent(paCurrentName)}/activity?${params}`);
     if (!r.ok) {
       document.getElementById('pa-timeline').innerHTML = `<li class="event-empty">Could not load activity (${r.status}).</li>`;
       return;
@@ -1841,6 +1867,13 @@ function renderPersonTimeline(rows) {
 
 document.getElementById('pa-period')?.addEventListener('change', refreshPersonActivity);
 document.getElementById('pa-back')?.addEventListener('click', () => showRoute('users'));
+// Clearing the "Showing <date>" chip drops back to the standard 30-day window
+// without leaving the page — fetches a wider dataset, swaps the UI back.
+document.getElementById('pa-date-chip-clear')?.addEventListener('click', () => {
+  paDateOverride = null;
+  syncPaDateChip();
+  refreshPersonActivity();
+});
 
 // ── Maps page (Leaflet) ──────────────────────────────────
 let mapInstance = null;
@@ -1940,7 +1973,211 @@ async function refreshAnalyticsCharts() {
   renderTypeDonut(data.byType);
   renderHorizontalBars('chart-camera', data.byCamera, 'camera', 'n');
   renderHorizontalBars('chart-people', data.byPerson, 'name', 'n');
+  refreshDaywiseTable(days);
 }
+
+// Day-wise per-person table on the Analytics page. Each row links into the
+// existing person-activity drill-down — we already have the underscored
+// `nameKey` from the backend, so no enrollment lookup is needed.
+let daywiseAllRows = []; // cached for the in-card date filter
+
+function todayYmd() {
+  // Local-date YYYY-MM-DD (avoid toISOString which is UTC and can roll a day).
+  const d = new Date();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+async function refreshDaywiseTable(days) {
+  const tbody = document.querySelector('#daywise-table tbody');
+  if (!tbody) return;
+  let data;
+  try {
+    data = await (await authedFetch(`${API}/analytics-daywise?days=${days}`)).json();
+  } catch { return; }
+  daywiseAllRows = data.rows || [];
+
+  // Constrain the picker to the *window* (period dropdown), not to the days
+  // that happen to have rows. If today has no incidents yet, today should
+  // still be selectable — the empty state explains the "no data" case, but
+  // greying it out makes the user think the picker is broken.
+  const filterInput = document.getElementById('daywise-date-filter');
+  if (filterInput) {
+    const today = todayYmd();
+    const minDate = new Date();
+    minDate.setDate(minDate.getDate() - (Number(days) || 7));
+    const mm = String(minDate.getMonth() + 1).padStart(2, '0');
+    const dd = String(minDate.getDate()).padStart(2, '0');
+    filterInput.min = `${minDate.getFullYear()}-${mm}-${dd}`;
+    filterInput.max = today;
+    if (!filterInput.value) {
+      filterInput.value = today;
+      document.getElementById('daywise-date-clear').style.display = '';
+    }
+  }
+  renderDaywiseTable();
+}
+
+function renderDaywiseTable() {
+  renderDaywiseInto({
+    rows: daywiseAllRows,
+    dateFilter: document.getElementById('daywise-date-filter')?.value || '',
+    tableId: 'daywise-table',
+    emptyId: 'daywise-empty',
+  });
+}
+
+// Shared row renderer — used by both the Analytics "Daily activity" card and
+// the Attendance page, so the table layout / cell formatting / drill-in
+// behavior stay identical when we tweak one of them.
+function renderDaywiseInto({ rows, dateFilter, tableId, emptyId }) {
+  const table = document.getElementById(tableId);
+  const tbody = table?.querySelector('tbody');
+  const empty = document.getElementById(emptyId);
+  if (!tbody) return;
+
+  const filtered = dateFilter ? rows.filter((r) => r.day === dateFilter) : rows;
+  tbody.innerHTML = '';
+  if (filtered.length === 0) {
+    table.style.display = 'none';
+    if (empty) {
+      empty.style.display = '';
+      empty.textContent = dateFilter
+        ? `No recognized people on ${dateFilter}.`
+        : 'No recognized people in this window.';
+    }
+    return;
+  }
+  table.style.display = '';
+  if (empty) empty.style.display = 'none';
+
+  const fmtClock = (iso) => {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+  const fmtDay = (ymd) => {
+    const d = new Date(ymd + 'T00:00:00');
+    return Number.isNaN(d.getTime()) ? ymd : d.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' });
+  };
+
+  for (const r of filtered) {
+    const tr = document.createElement('tr');
+    const cameras = (r.cameras || []).map((c) =>
+      `<span class="daywise-camera-pill">${escapeHtml(c)}</span>`).join('');
+    // Enrollment avatar — same endpoint the People card and activity page
+    // hero use. If the file is missing the <img> fires onerror and we drop
+    // back to an initial bubble so the row stays balanced.
+    const avatarUrl = `${API}/enrollment/${encodeURIComponent(r.nameKey)}/image?token=${encodeURIComponent(token)}`;
+    const initial = escapeHtml((r.name || '?').trim().charAt(0).toUpperCase());
+    tr.innerHTML = `
+      <td>${escapeHtml(fmtDay(r.day))}</td>
+      <td>
+        <div class="person-cell">
+          <span class="person-cell-avatar">
+            <img src="${avatarUrl}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='grid';">
+            <span class="person-cell-initial" style="display:none">${initial}</span>
+          </span>
+          <span>${escapeHtml(r.name)}</span>
+        </div>
+      </td>
+      <td>${r.n}</td>
+      <td>${cameras || '—'}</td>
+      <td>${fmtClock(r.firstSeen)}</td>
+      <td>${fmtClock(r.lastSeen)}</td>
+      <td><button class="row-action view">View details</button></td>
+    `;
+    tr.querySelector('.row-action').addEventListener('click', () => {
+      openPersonActivity({ name: r.nameKey, type: 'standard', notes: '' }, { date: r.day });
+    });
+    tbody.appendChild(tr);
+  }
+}
+
+// ── Attendance page ──────────────────────────────────────
+// Reuses /analytics-daywise: one row per (day, recognized person). The
+// summary tiles show *today's* totals (or the filtered day's totals when a
+// date is picked) so the page works as a daily attendance roster.
+let attendanceAllRows = [];
+
+async function refreshAttendance() {
+  const sel = document.getElementById('attendance-period');
+  const days = Number(sel?.value || 7);
+  let data;
+  try {
+    data = await (await authedFetch(`${API}/analytics-daywise?days=${days}`)).json();
+  } catch { return; }
+  attendanceAllRows = data.rows || [];
+
+  const filterInput = document.getElementById('attendance-date-filter');
+  if (filterInput) {
+    const today = todayYmd();
+    const minDate = new Date();
+    minDate.setDate(minDate.getDate() - days);
+    const mm = String(minDate.getMonth() + 1).padStart(2, '0');
+    const dd = String(minDate.getDate()).padStart(2, '0');
+    filterInput.min = `${minDate.getFullYear()}-${mm}-${dd}`;
+    filterInput.max = today;
+    if (!filterInput.value) {
+      filterInput.value = today;
+      document.getElementById('attendance-date-clear').style.display = '';
+    }
+  }
+  renderAttendance();
+}
+
+function renderAttendance() {
+  const dateFilter = document.getElementById('attendance-date-filter')?.value || '';
+  renderDaywiseInto({
+    rows: attendanceAllRows,
+    dateFilter,
+    tableId: 'attendance-table',
+    emptyId: 'attendance-empty',
+  });
+  // Summary tiles roll up the visible rows. With a date filter active they
+  // describe a single day; with no filter they describe the whole window.
+  const visible = dateFilter
+    ? attendanceAllRows.filter((r) => r.day === dateFilter)
+    : attendanceAllRows;
+  const uniquePeople = new Set(visible.map((r) => r.name)).size;
+  const totalDetections = visible.reduce((s, r) => s + (Number(r.n) || 0), 0);
+  let firstIso = null, lastIso = null;
+  for (const r of visible) {
+    if (r.firstSeen && (!firstIso || new Date(r.firstSeen) < new Date(firstIso))) firstIso = r.firstSeen;
+    if (r.lastSeen  && (!lastIso  || new Date(r.lastSeen)  > new Date(lastIso)))  lastIso  = r.lastSeen;
+  }
+  const fmtAt = (iso) => iso
+    ? new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : '—';
+  document.getElementById('att-stat-people').textContent = uniquePeople;
+  document.getElementById('att-stat-total').textContent  = totalDetections;
+  document.getElementById('att-stat-first').textContent  = fmtAt(firstIso);
+  document.getElementById('att-stat-last').textContent   = fmtAt(lastIso);
+}
+
+document.getElementById('attendance-period')?.addEventListener('change', refreshAttendance);
+document.getElementById('attendance-date-filter')?.addEventListener('change', () => {
+  const v = document.getElementById('attendance-date-filter').value;
+  document.getElementById('attendance-date-clear').style.display = v ? '' : 'none';
+  renderAttendance();
+});
+document.getElementById('attendance-date-clear')?.addEventListener('click', () => {
+  document.getElementById('attendance-date-filter').value = '';
+  document.getElementById('attendance-date-clear').style.display = 'none';
+  renderAttendance();
+});
+
+document.getElementById('daywise-date-filter')?.addEventListener('change', () => {
+  const v = document.getElementById('daywise-date-filter').value;
+  document.getElementById('daywise-date-clear').style.display = v ? '' : 'none';
+  renderDaywiseTable();
+});
+document.getElementById('daywise-date-clear')?.addEventListener('click', () => {
+  const input = document.getElementById('daywise-date-filter');
+  input.value = '';
+  document.getElementById('daywise-date-clear').style.display = 'none';
+  renderDaywiseTable();
+});
 
 document.getElementById('analytics-charts-period')?.addEventListener('change', refreshAnalyticsCharts);
 
@@ -1951,6 +2188,7 @@ const PAGES = {
   users:     'page-users',
   incidents: 'page-incidents',
   analytics: 'page-analytics',
+  attendance:'page-attendance',
   maps:      'page-maps',
   settings:  'page-settings',
   // Hidden routes (not in sidebar; entered via in-page actions).
@@ -1977,6 +2215,7 @@ function showRoute(route) {
   if (route === 'users')     refreshEnrollments();
   if (route === 'settings')  refreshFeatures();
   if (route === 'analytics') refreshAnalyticsCharts();
+  if (route === 'attendance') refreshAttendance();
   if (route === 'maps')      refreshMapPage();
   if (route === 'incidents') {
     refreshIncidentsTable();
