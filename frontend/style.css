@@ -1093,12 +1093,137 @@ button { font-family: inherit; }
 }
 .latlng-row .btn-secondary svg { width: 14px; height: 14px; }
 
+/* ── Person Activity drill-down ───────────────────────── */
+.person-activity-hero {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.person-activity-avatar {
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+}
+
+.stat-tile { padding: 14px 16px; }
+.stat-tile-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+.stat-tile-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.stat-tile-datetime {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
+  cursor: help;
+}
+.stat-tile-sub {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pa-timeline {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.pa-timeline-row {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  gap: 12px;
+  align-items: center;
+  padding: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.pa-timeline-row .event-thumb,
+.pa-thumb-placeholder {
+  width: 60px;
+  height: 44px;
+  border-radius: 6px;
+}
+.pa-thumb-placeholder {
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+  font-size: 16px;
+}
+.pa-timeline-cam {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pa-timeline-sub {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+
+@media (max-width: 1100px) {
+  #page-person-activity .info-cards[style*="repeat(5"] { grid-template-columns: repeat(2, 1fr) !important; }
+}
+
+/* Movement-path Leaflet map */
+.pa-map {
+  width: 100%;
+  height: 380px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: #14141a;
+}
+/* Numbered "stop" pins on the path. The .path-stop-wrap class strips
+   Leaflet's default white background; .path-stop is our actual circle. */
+.path-stop-wrap { background: transparent !important; border: none !important; }
+.path-stop {
+  width: 28px;
+  height: 28px;
+  line-height: 28px;
+  text-align: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  font-size: 12px;
+  font-family: var(--font);
+  border: 2px solid #fff;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+}
+.path-stop.is-start { background: var(--success); }
+.path-stop.is-end   { background: var(--danger); }
+
 /* ── Maps page ────────────────────────────────────────── */
 .map-container {
   width: 100%;
   height: calc(100vh - 220px);
   min-height: 420px;
-  background: var(--bg);
+  /* Slightly lighter than --bg so the map area is still visible if the
+     tile CDN is unreachable — easier to debug than pitch-black. */
+  background: #14141a;
 }
 /* Override Leaflet's default light popup so it matches the dark dashboard. */
 .leaflet-popup-content-wrapper,
@@ -1109,7 +1234,18 @@ button { font-family: inherit; }
 }
 .leaflet-popup-content { margin: 10px 12px; font-family: var(--font); font-size: 13px; }
 .leaflet-popup-content .map-popup-title { font-weight: 600; margin-bottom: 4px; }
-.leaflet-popup-content .map-popup-sub   { margin-bottom: 6px; }
+.leaflet-popup-content .map-popup-time  {
+  font-size: 13px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+  margin-bottom: 2px;
+}
+.leaflet-popup-content .map-popup-sub   {
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
 .leaflet-popup-content .map-popup-rtsp code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;

@@ -806,6 +806,112 @@ app.get('/analytics', async (req, res) => {
   }
 });
 
+// ── Per-person activity (drill-down from the People page) ─────
+// Note on the name shapes: enrollments.name is the sanitized form (spaces
+// → underscores) but incidents.name is the display form (returned by the
+// AI worker via `k.replace('_', ' ')`). The endpoint accepts either and
+// matches on the display form for incidents.
+app.get('/person/:name/activity', async (req, res) => {
+  const userId = req.user.uid;
+  const safe = sanitizeName(req.params.name);
+  if (!safe) return res.status(400).json({ error: 'invalid name' });
+  const displayName = safe.replace(/_/g, ' ');
+  const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
+  const since = new Date(Date.now() - days * 24 * 3600 * 1000);
+  const pool = db.getPool();
+
+  try {
+    const [metaRows] = await pool.query(
+      'SELECT name, type, notes FROM enrollments WHERE user_id = ? AND name = ? LIMIT 1',
+      [userId, safe],
+    );
+    if (metaRows.length === 0) return res.status(404).json({ error: 'person not found' });
+    const meta = metaRows[0];
+
+    // All queries below only look at recognized face detections for this name.
+    const baseWhere = `user_id = ? AND name = ? AND type = 'face' AND created_at >= ?`;
+    const baseArgs = [userId, displayName, since];
+
+    const [summaryRows] = await pool.query(
+      `SELECT COUNT(*) AS total,
+              MIN(created_at) AS firstSeen,
+              MAX(created_at) AS lastSeen,
+              COUNT(DISTINCT camera_name) AS distinctCameras,
+              COUNT(DISTINCT DATE(created_at)) AS distinctDays
+       FROM incidents WHERE ${baseWhere}`,
+      baseArgs,
+    );
+    const s = summaryRows[0];
+
+    const [byCamera] = await pool.query(
+      `SELECT IFNULL(camera_name, 'Unknown') AS camera, COUNT(*) AS n
+       FROM incidents WHERE ${baseWhere}
+       GROUP BY camera ORDER BY n DESC LIMIT 10`,
+      baseArgs,
+    );
+
+    const [byHourRaw] = await pool.query(
+      `SELECT HOUR(created_at) AS hour, COUNT(*) AS n
+       FROM incidents WHERE ${baseWhere}
+       GROUP BY hour`,
+      baseArgs,
+    );
+    const byHour = Array(24).fill(0);
+    for (const r of byHourRaw) byHour[r.hour] = Number(r.n);
+
+    const [byDay] = await pool.query(
+      `SELECT DATE(created_at) AS day, COUNT(*) AS n
+       FROM incidents WHERE ${baseWhere}
+       GROUP BY day ORDER BY day`,
+      baseArgs,
+    );
+
+    // Timeline rows carry their camera's lat/lng (when set) so the activity
+    // page can plot a movement path. Self-LEFT-JOIN on user + camera name —
+    // if a camera was renamed or deleted, lat/lng come back NULL and the
+    // frontend simply skips that stop on the path map.
+    const [timeline] = await pool.query(
+      `SELECT i.id, i.camera_name AS cameraName, i.confidence,
+              i.snapshot_path AS snapshot, i.created_at AS createdAt,
+              c.lat, c.lng
+       FROM incidents i
+       LEFT JOIN cameras c
+         ON c.user_id = i.user_id AND c.camera_name = i.camera_name
+       WHERE i.user_id = ? AND i.name = ? AND i.type = 'face' AND i.created_at >= ?
+       ORDER BY i.created_at DESC LIMIT 100`,
+      baseArgs,
+    );
+
+    res.json({
+      name: safe,
+      displayName,
+      type: meta.type,
+      notes: meta.notes,
+      days,
+      summary: {
+        total: Number(s.total || 0),
+        firstSeen: s.firstSeen,
+        lastSeen:  s.lastSeen,
+        distinctCameras: Number(s.distinctCameras || 0),
+        distinctDays:    Number(s.distinctDays || 0),
+      },
+      byCamera,
+      byHour,
+      byDay: byDay.map((d) => ({
+        day: (d.day instanceof Date) ? d.day.toISOString().slice(0, 10) : String(d.day).slice(0, 10),
+        n: Number(d.n),
+      })),
+      timeline: timeline.map((r) => ({
+        ...r,
+        lat: r.lat == null ? null : Number(r.lat),
+        lng: r.lng == null ? null : Number(r.lng),
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Analytics charts (per user) ───────────────────────────────
 // Returns aggregated data the Analytics page renders as SVG charts.
 // Single endpoint = single round-trip; the data is small enough.

@@ -365,6 +365,80 @@
         </section>
       </section>
 
+      <!-- Person activity drill-down (opened from People card) -->
+      <section class="page" id="page-person-activity" style="display:none">
+        <div class="page-header">
+          <div class="person-activity-hero">
+            <img id="pa-avatar" class="person-activity-avatar" alt="">
+            <div>
+              <h1 class="page-title" id="pa-name">—</h1>
+              <p class="page-sub">
+                <span class="type-badge" id="pa-type">standard</span>
+                <span id="pa-notes" style="margin-left:8px"></span>
+              </p>
+            </div>
+          </div>
+          <div class="page-actions">
+            <div class="select-wrap">
+              <svg><use href="#i-chart"/></svg>
+              <select id="pa-period">
+                <option value="7">Last 7 days</option>
+                <option value="14">Last 14 days</option>
+                <option value="30" selected>Last 30 days</option>
+                <option value="90">Last 90 days</option>
+              </select>
+            </div>
+            <button class="btn-secondary" id="pa-back">← Back to People</button>
+          </div>
+        </div>
+
+        <div class="info-cards" style="grid-template-columns: repeat(5, 1fr)">
+          <section class="card stat-tile"><div class="stat-tile-label">Total detections</div><div class="stat-tile-value" id="pa-stat-total">0</div></section>
+          <section class="card stat-tile"><div class="stat-tile-label">First seen</div><div class="stat-tile-value" id="pa-stat-first">—</div></section>
+          <section class="card stat-tile"><div class="stat-tile-label">Last seen</div><div class="stat-tile-value" id="pa-stat-last">—</div></section>
+          <section class="card stat-tile"><div class="stat-tile-label">Cameras</div><div class="stat-tile-value" id="pa-stat-cams">0</div></section>
+          <section class="card stat-tile"><div class="stat-tile-label">Active days</div><div class="stat-tile-value" id="pa-stat-days">0</div></section>
+        </div>
+
+        <section class="card analytics-card">
+          <header class="card-head">
+            <h2>When they're seen</h2>
+            <span class="card-sub">Detections by hour of day</span>
+          </header>
+          <div id="pa-chart-hour" class="chart-heatmap"></div>
+        </section>
+
+        <section class="card analytics-card">
+          <header class="card-head">
+            <h2>Detections over time</h2>
+          </header>
+          <div id="pa-chart-daily" class="chart-area"></div>
+        </section>
+
+        <section class="card analytics-card">
+          <header class="card-head">
+            <h2>Movement path</h2>
+            <span class="card-sub">Cameras where this person was seen, in chronological order</span>
+          </header>
+          <div id="pa-map" class="pa-map"></div>
+          <div id="pa-map-empty" class="chart-empty" style="display:none">
+            None of the cameras where this person was seen have a location set yet.
+          </div>
+        </section>
+
+        <div class="info-cards" style="grid-template-columns: 1fr 1fr">
+          <section class="card analytics-card">
+            <header class="card-head"><h2>Where they're seen</h2></header>
+            <div id="pa-chart-camera" class="chart-bars"></div>
+          </section>
+
+          <section class="card analytics-card">
+            <header class="card-head"><h2>Recent timeline</h2></header>
+            <ul id="pa-timeline" class="pa-timeline"></ul>
+          </section>
+        </div>
+      </section>
+
       <!-- Maps page -->
       <section class="page" id="page-maps" style="display:none">
         <div class="page-header">

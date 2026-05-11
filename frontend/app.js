@@ -111,6 +111,22 @@ function fmtTimestamp(iso) {
   return `${date} ${time}`;
 }
 
+// Compact absolute "May 10, 1:42:18 PM" — for stat tiles where the user wants
+// the precise moment something happened (not just "12 minutes ago").
+function fmtAbsoluteShort(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return d.toLocaleString([], {
+    month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+}
+// Full "Monday, May 10, 2026 1:42:18 PM" — used as a hover tooltip.
+function fmtAbsoluteFull(iso) {
+  if (!iso) return null;
+  return new Date(iso).toLocaleString([], { dateStyle: 'full', timeStyle: 'medium' });
+}
+
 function fmtBytes(n) {
   if (n == null) return '—';
   const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
@@ -866,6 +882,31 @@ const EVENT_TITLES = {
   person: 'Motion Detected',
 };
 
+// Shared tile-layer config for every Leaflet map in the app. CartoDB's Dark
+// Matter palette matches the dashboard's dark theme and ships from a
+// different CDN than tile.openstreetmap.org (which is sometimes throttled
+// or blocked by ad blockers / corporate firewalls — symptom: black map).
+const DARK_TILE_URL = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+const DARK_TILE_OPTS = {
+  maxZoom: 19,
+  subdomains: 'abcd',
+  attribution: '© OpenStreetMap, © CARTO',
+};
+function attachDarkTiles(map) {
+  const layer = L.tileLayer(DARK_TILE_URL, DARK_TILE_OPTS);
+  // On failure, log once so we can spot blocked-tile-CDN cases instead of
+  // staring at a black square.
+  let warned = false;
+  layer.on('tileerror', () => {
+    if (!warned) {
+      warned = true;
+      console.warn('[Leaflet] tile load failed — check network / firewall. Map shows fallback colour.');
+    }
+  });
+  layer.addTo(map);
+  return layer;
+}
+
 function eventIconHtml(type) {
   const symId = type === 'fire' || type === 'smoke' ? '#i-fire'
     : type === 'face' ? '#i-users'
@@ -1076,6 +1117,12 @@ function buildEnrollmentCard(p) {
 
   const actions = document.createElement('div');
   actions.className = 'enroll-actions';
+  const actBtn = document.createElement('button');
+  actBtn.className = 'enroll-action';
+  actBtn.title = 'View activity history';
+  actBtn.textContent = 'Activity';
+  actBtn.addEventListener('click', () => openPersonActivity(p));
+
   const editBtn = document.createElement('button');
   editBtn.className = 'enroll-action';
   editBtn.title = 'Edit category';
@@ -1095,7 +1142,7 @@ function buildEnrollmentCard(p) {
     await authedFetch(`${API}/enrollment/${encodeURIComponent(p.name)}`, { method: 'DELETE' });
     refreshEnrollments();
   });
-  actions.append(editBtn, addBtn, delBtn);
+  actions.append(actBtn, editBtn, addBtn, delBtn);
 
   li.append(img, meta, actions);
   return li;
@@ -1519,6 +1566,259 @@ function renderHorizontalBars(elId, rows, labelKey, valueKey) {
   }
 }
 
+// ── Person Activity (drill-down from People page) ────────
+let paCurrentName = null;
+
+function openPersonActivity(p) {
+  paCurrentName = p.name;
+  // Update header chrome before the fetch so the user sees something instant.
+  document.getElementById('pa-name').textContent = p.name.replace(/_/g, ' ');
+  document.getElementById('pa-avatar').src =
+    `${API}/enrollment/${encodeURIComponent(p.name)}/image?token=${encodeURIComponent(token)}`;
+  const badge = document.getElementById('pa-type');
+  badge.className = `type-badge type-${p.type}`;
+  badge.textContent = PERSON_TYPE_LABEL[p.type] || p.type;
+  document.getElementById('pa-notes').textContent = p.notes || '';
+  document.getElementById('pa-period').value = '30';
+  // Route to the page (uses the standard router but it's a hidden route).
+  showRoute('person-activity');
+  refreshPersonActivity();
+}
+
+async function refreshPersonActivity() {
+  if (!paCurrentName) return;
+  const days = Number(document.getElementById('pa-period').value || 30);
+  let data;
+  try {
+    const r = await authedFetch(`${API}/person/${encodeURIComponent(paCurrentName)}/activity?days=${days}`);
+    if (!r.ok) {
+      document.getElementById('pa-timeline').innerHTML = `<li class="event-empty">Could not load activity (${r.status}).</li>`;
+      return;
+    }
+    data = await r.json();
+  } catch (err) {
+    console.error('[activity]', err);
+    return;
+  }
+
+  // Stat tiles — simple counts on the left, dual-line timestamps on the right.
+  document.getElementById('pa-stat-total').textContent = data.summary.total;
+  document.getElementById('pa-stat-cams').textContent  = data.summary.distinctCameras;
+  document.getElementById('pa-stat-days').textContent  = data.summary.distinctDays;
+  renderTimestampTile('pa-stat-first', data.summary.firstSeen);
+  renderTimestampTile('pa-stat-last',  data.summary.lastSeen);
+
+  renderPersonHourly(data.byHour);
+  renderDailyTrend(data.byDay.map((d) => ({ day: d.day, n: d.n, alerts: 0 })));
+  // The line chart writes to #chart-daily — re-target.
+  document.getElementById('pa-chart-daily').innerHTML =
+    document.getElementById('chart-daily').innerHTML;
+
+  renderHorizontalBars('pa-chart-camera', data.byCamera, 'camera', 'n');
+  renderPersonPathMap(data.timeline);
+  renderPersonTimeline(data.timeline.slice(0, 40));
+}
+
+// Renders an exact wall-clock value as the main line + relative time below.
+function renderTimestampTile(id, iso) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.innerHTML = '';
+  if (!iso) { el.textContent = '—'; return; }
+
+  const abs = document.createElement('div');
+  abs.className = 'stat-tile-datetime';
+  abs.textContent = fmtAbsoluteShort(iso);
+  abs.title = fmtAbsoluteFull(iso);
+
+  const rel = document.createElement('div');
+  rel.className = 'stat-tile-sub';
+  rel.textContent = fmtTime(iso);
+
+  el.append(abs, rel);
+}
+
+// Build chronological "stops" from a newest-first timeline. Consecutive
+// detections at the same camera collapse into a single stop with a count
+// and a time range — much cleaner on the map than dozens of overlapping pins.
+function buildPersonStops(timeline) {
+  const chrono = [...timeline].reverse();    // backend returns DESC; flip
+  const stops = [];
+  for (const t of chrono) {
+    if (t.lat == null || t.lng == null) continue;
+    const last = stops[stops.length - 1];
+    if (last && last.camera === t.cameraName) {
+      last.count++;
+      last.lastAt = t.createdAt;
+      if (t.snapshot && !last.snapshot) last.snapshot = t.snapshot;
+    } else {
+      stops.push({
+        camera: t.cameraName,
+        lat: t.lat,
+        lng: t.lng,
+        firstAt: t.createdAt,
+        lastAt: t.createdAt,
+        count: 1,
+        snapshot: t.snapshot,
+      });
+    }
+  }
+  return stops;
+}
+
+let pa_mapInstance = null;
+let pa_mapLayers = [];
+
+function ensurePaMap() {
+  if (pa_mapInstance) return pa_mapInstance;
+  if (typeof L === 'undefined') return null;
+  pa_mapInstance = L.map('pa-map', { zoomControl: true, worldCopyJump: true }).setView([0, 0], 2);
+  attachDarkTiles(pa_mapInstance);
+  return pa_mapInstance;
+}
+
+function clearPaMapLayers() {
+  for (const l of pa_mapLayers) l.remove();
+  pa_mapLayers = [];
+}
+
+// Numbered Leaflet divIcon so each stop carries its order on the path.
+function pathStopIcon(n, isStart, isEnd) {
+  const cls = `path-stop ${isStart ? 'is-start' : ''} ${isEnd ? 'is-end' : ''}`.trim();
+  return L.divIcon({
+    className: 'path-stop-wrap',
+    html: `<div class="${cls}">${n}</div>`,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
+  });
+}
+
+function renderPersonPathMap(timeline) {
+  const stops = buildPersonStops(timeline);
+  const empty = document.getElementById('pa-map-empty');
+  const mapEl = document.getElementById('pa-map');
+  if (stops.length === 0) {
+    if (mapEl) mapEl.style.display = 'none';
+    if (empty) empty.style.display = '';
+    return;
+  }
+  if (mapEl) mapEl.style.display = '';
+  if (empty) empty.style.display = 'none';
+
+  const map = ensurePaMap();
+  if (!map) return;
+  // Leaflet needs the container to have its final size before it lays out
+  // tiles. Hit it a few times because page transitions / responsive grid
+  // changes can resize the container after the first frame.
+  [50, 200, 600].forEach((t) => setTimeout(() => map.invalidateSize(), t));
+  clearPaMapLayers();
+
+  // Polyline first so markers sit on top.
+  if (stops.length >= 2) {
+    const line = L.polyline(stops.map((s) => [s.lat, s.lng]), {
+      color: '#6366f1',
+      weight: 3,
+      opacity: 0.85,
+      dashArray: '6 6',
+    }).addTo(map);
+    pa_mapLayers.push(line);
+  }
+
+  stops.forEach((s, i) => {
+    const isStart = i === 0;
+    const isEnd   = i === stops.length - 1;
+    const m = L.marker([s.lat, s.lng], { icon: pathStopIcon(i + 1, isStart, isEnd) }).addTo(map);
+
+    // Show the exact wall-clock time as the primary info (CCTV use case)
+    // and keep relative ("21m ago") underneath for at-a-glance recency.
+    const absRange = s.firstAt === s.lastAt
+      ? fmtAbsoluteShort(s.firstAt)
+      : `${fmtAbsoluteShort(s.firstAt)} → ${fmtAbsoluteShort(s.lastAt)}`;
+    const relRange = s.firstAt === s.lastAt
+      ? fmtTime(s.firstAt)
+      : `${fmtTime(s.firstAt)} → ${fmtTime(s.lastAt)}`;
+
+    m.bindPopup(`
+      <div class="map-popup">
+        <div class="map-popup-title">${escapeHtml(s.camera)} <small>· stop ${i + 1}</small></div>
+        <div class="map-popup-time" title="${escapeHtml(fmtAbsoluteFull(s.firstAt) || '')}">${escapeHtml(absRange)}</div>
+        <div class="map-popup-sub">${s.count} detection${s.count === 1 ? '' : 's'} · ${escapeHtml(relRange)}</div>
+      </div>
+    `);
+    pa_mapLayers.push(m);
+  });
+
+  const bounds = L.latLngBounds(stops.map((s) => [s.lat, s.lng]));
+  map.fitBounds(bounds, { padding: [40, 40], maxZoom: 17 });
+}
+
+function renderPersonHourly(byHour) {
+  const el = document.getElementById('pa-chart-hour');
+  if (!el) return;
+  const max = Math.max(...byHour, 1);
+  const cellW = 28, gap = 3, padLeft = 22, padBottom = 24, top = 12, h = 110;
+  const W = padLeft + 24 * (cellW + gap);
+  const innerH = h - top - padBottom;
+
+  const bars = byHour.map((n, i) => {
+    const bh = n > 0 ? Math.max(2, (n / max) * innerH) : 0;
+    const x = padLeft + i * (cellW + gap);
+    const y = top + (innerH - bh);
+    const color = n === 0 ? 'rgba(255,255,255,0.05)'
+                : `rgba(99,102,241,${(0.30 + (n / max) * 0.65).toFixed(2)})`;
+    return `<rect x="${x}" y="${y}" width="${cellW}" height="${bh || 2}" rx="2" fill="${color}"><title>${i}:00 — ${n} detection${n === 1 ? '' : 's'}</title></rect>`;
+  }).join('');
+
+  const xLabels = [0, 6, 12, 18].map((hr) => {
+    const x = padLeft + hr * (cellW + gap) + cellW / 2;
+    return `<text x="${x}" y="${h - 8}" text-anchor="middle" class="chart-label">${hr}:00</text>`;
+  }).join('');
+
+  el.innerHTML =
+    `<svg viewBox="0 0 ${W} ${h}" preserveAspectRatio="xMidYMid meet">
+       <text x="0" y="${top + innerH / 2 + 4}" class="chart-label">Hits</text>
+       ${bars}
+       ${xLabels}
+     </svg>`;
+}
+
+function renderPersonTimeline(rows) {
+  const ul = document.getElementById('pa-timeline');
+  if (!ul) return;
+  if (!rows || rows.length === 0) {
+    ul.innerHTML = '<li class="event-empty">No detections in this period yet.</li>';
+    return;
+  }
+  ul.innerHTML = '';
+  for (const row of rows) {
+    const li = document.createElement('li');
+    li.className = 'pa-timeline-row';
+    const thumb = snapshotThumbEl(row.snapshot, `${paCurrentName.replace(/_/g, ' ')} · ${row.cameraName || ''}`);
+    if (thumb) li.appendChild(thumb);
+    else {
+      const ph = document.createElement('span');
+      ph.className = 'pa-thumb-placeholder';
+      ph.textContent = '—';
+      li.appendChild(ph);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'pa-timeline-meta';
+    const cam = document.createElement('div');
+    cam.className = 'pa-timeline-cam';
+    cam.textContent = row.cameraName || '—';
+    const sub = document.createElement('div');
+    sub.className = 'pa-timeline-sub';
+    const conf = row.confidence != null ? `${Math.round(row.confidence * 100)}%` : '—';
+    sub.textContent = `${conf} · ${fmtTime(row.createdAt)}`;
+    meta.append(cam, sub);
+    li.appendChild(meta);
+    ul.appendChild(li);
+  }
+}
+
+document.getElementById('pa-period')?.addEventListener('change', refreshPersonActivity);
+document.getElementById('pa-back')?.addEventListener('click', () => showRoute('users'));
+
 // ── Maps page (Leaflet) ──────────────────────────────────
 let mapInstance = null;
 let mapMarkers = [];
@@ -1534,10 +1834,7 @@ function ensureMap() {
     zoomControl: true,
     worldCopyJump: true,
   }).setView([0, 0], 2);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '© OpenStreetMap',
-  }).addTo(mapInstance);
+  attachDarkTiles(mapInstance);
   return mapInstance;
 }
 
@@ -1564,7 +1861,10 @@ async function refreshMapPage() {
   if (!map) return;
   // Leaflet only sizes correctly once the container has width — invalidate
   // after the first paint so the tiles render in the right place.
-  setTimeout(() => map.invalidateSize(), 50);
+  // Leaflet needs the container to have its final size before it lays out
+  // tiles. Hit it a few times because page transitions / responsive grid
+  // changes can resize the container after the first frame.
+  [50, 200, 600].forEach((t) => setTimeout(() => map.invalidateSize(), t));
 
   clearMapMarkers();
   const bounds = L.latLngBounds([]);
@@ -1630,6 +1930,8 @@ const PAGES = {
   analytics: 'page-analytics',
   maps:      'page-maps',
   settings:  'page-settings',
+  // Hidden routes (not in sidebar; entered via in-page actions).
+  'person-activity': 'page-person-activity',
 };
 // "Incident" rules — what shows up on the Incidents page and Recent
 // Incidents rail. Fire/smoke always count; face detections count only when
