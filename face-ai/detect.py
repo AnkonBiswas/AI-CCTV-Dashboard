@@ -24,10 +24,10 @@ YOLO_MODEL_PATH = os.path.join(HERE, 'yolov8n.pt') # Standard nano model
 FIRE_MODEL_PATH = os.path.join(HERE, 'fire_model.pt') # Optional custom model
 
 # When fire/smoke or a recognized face appears, save a JPEG of the (full-res)
-# frame with boxes burned in. Throttled per-stream so a steady fire doesn't
-# fill the disk; the same file gets referenced by every incident row from
-# that frame.
-SNAPSHOT_THROTTLE_S = 5.0
+# frame with boxes burned in. Throttles are PER trigger type so a steady
+# stream of face recognitions can't shadow out fire/smoke snapshots.
+INCIDENT_SNAPSHOT_THROTTLE_S = 1.0   # fire/smoke — rare and important, snapshot ~every second
+FACE_SNAPSHOT_THROTTLE_S     = 5.0   # recognized faces — much higher volume
 SNAPSHOT_JPEG_QUALITY = 82
 
 FRAME_SKIP = 5               # Process every 5th frame to reduce CPU load
@@ -48,6 +48,11 @@ MIN_FACE_AREA_RATIO       = 0.005
 # Temporal stability: a name only "sticks" after the recognizer agrees on it
 # for this many consecutive processed frames. Suppresses single-frame mistakes.
 RECOGNITION_CONFIRM_FRAMES = 2
+
+# Same idea for the HSV fire fallback: an incident is only reported after this
+# many consecutive frames of *flickering* (moving) hot-core + halo. Static
+# warm objects (lighter bodies, sunsets, warm walls) can't accrue a streak.
+FIRE_CONFIRM_FRAMES = 3
 
 def log(obj):
     sys.stdout.write(json.dumps(obj) + '\n')
@@ -86,7 +91,8 @@ if os.path.exists(FIRE_MODEL_PATH) and os.path.getsize(FIRE_MODEL_PATH) > 100000
     except Exception as e:
         log({'type': 'warning', 'message': f'Failed to load fire model: {e}'})
 else:
-    log({'type': 'info', 'message': 'No custom fire model found (using color-based fallback)'})
+    log({'type': 'info', 'message': 'No custom fire model found (using color-based fallback). '
+                                    'Run `python face-ai/download_fire_model.py` for accurate detection.'})
 
 yolo_lock = threading.Lock()
 
@@ -307,7 +313,8 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
     enrolled_mtime = 0
     last_seen_id = 0
     last_processed_at = 0
-    last_snapshot_at  = 0
+    last_incident_snap_at = 0   # fire/smoke
+    last_face_snap_at     = 0   # recognized faces
     period = 1.0 / TARGET_FPS
 
     # For incident heuristics (e.g. fight)
@@ -315,6 +322,10 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
 
     # Temporal stability for face recognition. See COSINE_THRESHOLD docs above.
     name_streaks = {}  # bucket -> {'name': str, 'count': int}
+
+    # HSV fire-fallback temporal state (only used when fire_model.pt is missing).
+    fire_prev_sig = None  # (cx, cy, area) of last frame's best flame candidate
+    fire_streak   = 0     # consecutive frames the candidate has flickered/moved
 
     reader = LatestFrameReader(rtsp_url)
     try:
@@ -459,45 +470,105 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
                                 bx = box.xyxyn[0].tolist()
                                 incidents.append({'type': 'fire', 'confidence': float(box.conf[0]), 'box': bx})
                     else:
-                        # Fallback: Color-based detection for small flames (lighters, etc.)
-                        # Look for bright orange/red pixels in HSV space
+                        # Fallback when no real fire model is installed.
+                        # The naive "find orange contour" approach fires constantly on
+                        # lighter bodies, sunsets, brake lights, and warm walls. We
+                        # require three things to call something a flame:
+                        #   1. A near-white hot core (V>=240, sat-yellow band) — real
+                        #      flames are blackbody radiators; the hottest pixels
+                        #      saturate the sensor to white/yellow. Steady-state warm
+                        #      objects (plastic, walls) cannot.
+                        #   2. An orange/red halo immediately surrounding that core —
+                        #      separates flames from white LEDs, sun glints, and
+                        #      specular highlights that also have a near-white core.
+                        #   3. Flicker across consecutive frames — flames move; lighter
+                        #      bodies don't. A *static* hot+halo blob decays the streak
+                        #      instead of growing it, so a flame-coloured object can
+                        #      sit in frame forever without ever firing.
+                        # Only the highest-scoring candidate per frame is considered,
+                        # and only after FIRE_CONFIRM_FRAMES of consistent flicker.
                         hsv = cv2.cvtColor(small_frame, cv2.COLOR_BGR2HSV)
-                        # Narrow range: Intense Orange/Red only
-                        lower_fire = np.array([0, 150, 200], dtype="uint8")
-                        upper_fire = np.array([15, 255, 255], dtype="uint8")
-                        mask = cv2.inRange(hsv, lower_fire, upper_fire)
-                    
-                        # Clean up mask (Dilation to merge close sparks)
-                        mask = cv2.dilate(mask, None, iterations=2)
-                        mask = cv2.GaussianBlur(mask, (5, 5), 0)
-                    
-                        # Find contours
-                        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        for cnt in contours:
-                            area = cv2.contourArea(cnt)
-                            if area > 250: # Increased threshold from 100
-                                x, y, w_cnt, h_cnt = cv2.boundingRect(cnt)
-                                # Shape check: Flames are usually taller than wide or square-ish
-                                if h_cnt / w_cnt > 0.5: 
-                                    incidents.append({
-                                        'type': 'fire', 
-                                        'confidence': 0.9, 
-                                        'box': [x/w, y/h, (x+w_cnt)/w, (y+h_cnt)/h]
-                                    })
-                                    break 
+                        core_mask = cv2.inRange(hsv,
+                                                np.array([0,   80, 240], dtype="uint8"),
+                                                np.array([35, 255, 255], dtype="uint8"))
+                        halo_mask = cv2.inRange(hsv,
+                                                np.array([0,  150, 180], dtype="uint8"),
+                                                np.array([20, 255, 255], dtype="uint8"))
+
+                        candidate = None  # (score, x, y, bw, bh)
+                        if cv2.countNonZero(core_mask) >= 5:
+                            core_clean = cv2.dilate(core_mask, None, iterations=1)
+                            cnts, _ = cv2.findContours(core_clean, cv2.RETR_EXTERNAL,
+                                                      cv2.CHAIN_APPROX_SIMPLE)
+                            for cnt in cnts:
+                                area = cv2.contourArea(cnt)
+                                if area < 25: continue
+                                cx_, cy_, cw_, ch_ = cv2.boundingRect(cnt)
+                                ar = ch_ / max(1, cw_)
+                                if ar < 0.4 or ar > 4.0:  # not flame-shaped
+                                    continue
+                                # Expand the core box outward to include the halo.
+                                pad = max(cw_, ch_)
+                                bx_x  = max(0, cx_ - pad)
+                                bx_y  = max(0, cy_ - pad)
+                                bx_x2 = min(w, cx_ + cw_ + pad)
+                                bx_y2 = min(h, cy_ + ch_ + pad)
+                                halo_roi = halo_mask[bx_y:bx_y2, bx_x:bx_x2]
+                                halo_ratio = (cv2.countNonZero(halo_roi) /
+                                              float(max(1, halo_roi.size)))
+                                if halo_ratio < 0.05:  # core without halo = LED/glint
+                                    continue
+                                score = area * halo_ratio
+                                if candidate is None or score > candidate[0]:
+                                    candidate = (score, bx_x, bx_y,
+                                                 bx_x2 - bx_x, bx_y2 - bx_y)
+
+                        if candidate is not None:
+                            _, bx_x, bx_y, bx_w, bx_h = candidate
+                            sig = (bx_x + bx_w / 2.0,
+                                   bx_y + bx_h / 2.0,
+                                   bx_w * bx_h)
+                            if fire_prev_sig is not None:
+                                dx = abs(sig[0] - fire_prev_sig[0])
+                                dy = abs(sig[1] - fire_prev_sig[1])
+                                d_area = (abs(sig[2] - fire_prev_sig[2]) /
+                                          max(1.0, fire_prev_sig[2]))
+                                if (dx + dy) > 1.5 or d_area > 0.15:
+                                    fire_streak += 1
+                                else:
+                                    fire_streak = max(0, fire_streak - 1)
+                            fire_prev_sig = sig
+                            if fire_streak >= FIRE_CONFIRM_FRAMES:
+                                incidents.append({
+                                    'type': 'fire',
+                                    'confidence': min(0.85, 0.5 + candidate[0] / 50000.0),
+                                    'box': [bx_x / w, bx_y / h,
+                                            (bx_x + bx_w) / w,
+                                            (bx_y + bx_h) / h],
+                                })
+                        else:
+                            fire_streak = max(0, fire_streak - 1)
+                            fire_prev_sig = None
 
             except Exception as ex:
                 log({'type': 'warning', 'message': f'YOLO error: {ex}'})
 
-            # Snapshot trigger: any incident OR any recognized (named) face.
-            # Throttle per stream so a steady event doesn't fill the disk.
+            # Snapshot decision — fire/smoke take priority and have their own,
+            # tighter throttle; recognized faces are higher volume so the
+            # throttle there is more generous. If both happen in the same
+            # frame, the resulting snapshot satisfies both (boxes are drawn
+            # for everything in the frame).
             snapshot_path = None
-            should_snap = bool(incidents) or any(d.get('name') for d in detections)
+            has_incident = bool(incidents)
+            has_named_face = any(d.get('name') for d in detections)
             now_t = time.time()
-            if should_snap and (now_t - last_snapshot_at) >= SNAPSHOT_THROTTLE_S:
+            incident_due = has_incident   and (now_t - last_incident_snap_at) >= INCIDENT_SNAPSHOT_THROTTLE_S
+            face_due     = has_named_face and (now_t - last_face_snap_at)     >= FACE_SNAPSHOT_THROTTLE_S
+            if incident_due or face_due:
                 snapshot_path = save_snapshot(stream_id, frame, detections, incidents)
                 if snapshot_path:
-                    last_snapshot_at = now_t
+                    if has_incident:   last_incident_snap_at = now_t
+                    if has_named_face: last_face_snap_at     = now_t
 
             log({
                 'type': 'detections',

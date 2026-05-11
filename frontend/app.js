@@ -1923,7 +1923,7 @@ document.getElementById('analytics-charts-period')?.addEventListener('change', r
 
 // ── Routing (stub-friendly) ──────────────────────────────
 const PAGES = {
-  dashboard: 'page-dashboard', live: 'page-dashboard',
+  dashboard: 'page-dashboard',
   cameras:   'page-cameras',
   users:     'page-users',
   incidents: 'page-incidents',
