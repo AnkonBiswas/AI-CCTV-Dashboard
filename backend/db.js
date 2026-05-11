@@ -67,10 +67,15 @@ async function init() {
       camera_name VARCHAR(255) NOT NULL,
       rtsp_url TEXT NOT NULL,
       path_name VARCHAR(128) NOT NULL,
+      lat DECIMAL(10, 7) NULL,
+      lng DECIMAL(10, 7) NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_user (user_id)
     ) ENGINE=InnoDB
   `);
+  // Backfill the columns on installs that were created before lat/lng existed.
+  await ensureColumn('cameras', 'lat', 'DECIMAL(10, 7) NULL');
+  await ensureColumn('cameras', 'lng', 'DECIMAL(10, 7) NULL');
 
   // ── enrollments: per-person metadata (type, notes) ────────
   // The actual face images live on disk in face-ai/enrollments/<user_id>/.
@@ -110,6 +115,7 @@ async function init() {
     ) ENGINE=InnoDB
   `);
   await ensureColumn('incidents', 'user_id', 'INT NOT NULL DEFAULT 0');
+  await ensureColumn('incidents', 'snapshot_path', 'VARCHAR(255) NULL');
 
   await seedAdmin();
   await migrateLegacyEnrollments();

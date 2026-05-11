@@ -4,6 +4,7 @@
 <head>
   <meta charset="utf-8">
   <title>SecureVision · Surveillance Dashboard</title>
+  <link rel="stylesheet" href="vendor/leaflet.css">
   <link rel="stylesheet" href="style.css">
   <!-- Inter font from Google Fonts is non-blocking: if offline / air-gapped,
        the CSS font stack falls back to system-ui (still looks clean). -->
@@ -14,6 +15,7 @@
         media="print" onload="this.media='all'">
   <script src="vendor/hls.min.js"></script>
   <script src="vendor/socket.io.min.js"></script>
+  <script src="vendor/leaflet.js"></script>
 </head>
 
 <body>
@@ -98,12 +100,11 @@
         <a class="nav-item active" data-route="dashboard"><svg><use href="#i-grid"/></svg>Dashboard</a>
         <a class="nav-item"        data-route="live"><svg><use href="#i-eye"/></svg>Live View</a>
         <a class="nav-item disabled" data-route="playback"><svg><use href="#i-play"/></svg>Playback<span class="soon">Soon</span></a>
-        <a class="nav-item"        data-route="events"><svg><use href="#i-bell"/></svg>Events<span class="nav-badge" id="nav-events-badge">0</span></a>
+        <a class="nav-item"        data-route="incidents"><svg><use href="#i-alert"/></svg>Incidents<span class="nav-badge" id="nav-incidents-badge">0</span></a>
         <a class="nav-item"        data-route="cameras"><svg><use href="#i-camera"/></svg>Cameras</a>
-        <a class="nav-item disabled" data-route="maps"><svg><use href="#i-map"/></svg>Maps<span class="soon">Soon</span></a>
+        <a class="nav-item"        data-route="maps"><svg><use href="#i-map"/></svg>Maps</a>
         <a class="nav-item"        data-route="analytics"><svg><use href="#i-chart"/></svg>Analytics</a>
         <a class="nav-item disabled" data-route="reports"><svg><use href="#i-doc"/></svg>Reports<span class="soon">Soon</span></a>
-        <a class="nav-item"        data-route="alerts"><svg><use href="#i-alert"/></svg>Alerts</a>
         <a class="nav-item"        data-route="users"><svg><use href="#i-users"/></svg>Users</a>
         <a class="nav-item"        data-route="settings"><svg><use href="#i-settings"/></svg>Settings</a>
       </nav>
@@ -207,7 +208,7 @@
           <section class="card">
             <header class="card-head">
               <h2>Recent Events</h2>
-              <a class="link" data-route="events">View All</a>
+              <a class="link" data-route="incidents">View All</a>
             </header>
             <ul class="event-list" id="event-list">
               <li class="event-empty">No events yet.</li>
@@ -285,17 +286,17 @@
         </section>
       </section>
 
-      <!-- Events / Alerts page -->
-      <section class="page" id="page-events" style="display:none">
+      <!-- Incidents page (fire/smoke only — face/person live in dashboard "Recent Events") -->
+      <section class="page" id="page-incidents" style="display:none">
         <div class="page-header">
           <div>
-            <h1 class="page-title" id="events-title">Events</h1>
-            <p class="page-sub">All detection and incident events from your cameras.</p>
+            <h1 class="page-title">Incidents</h1>
+            <p class="page-sub">Fire and smoke alerts from your cameras.</p>
           </div>
         </div>
         <section class="card">
-          <table class="data-table" id="events-table">
-            <thead><tr><th>Type</th><th>Camera</th><th>Person</th><th>Confidence</th><th>Time</th></tr></thead>
+          <table class="data-table" id="incidents-table">
+            <thead><tr><th></th><th>Type</th><th>Camera</th><th>Person</th><th>Confidence</th><th>Time</th></tr></thead>
             <tbody></tbody>
           </table>
         </section>
@@ -364,6 +365,27 @@
         </section>
       </section>
 
+      <!-- Maps page -->
+      <section class="page" id="page-maps" style="display:none">
+        <div class="page-header">
+          <div>
+            <h1 class="page-title">Maps</h1>
+            <p class="page-sub">Geographic view of your cameras. Click a marker for details.</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn-secondary" id="map-fit-all">Fit to all</button>
+          </div>
+        </div>
+        <section class="card" style="padding: 0; overflow: hidden;">
+          <div id="map-container" class="map-container"></div>
+        </section>
+        <div id="map-empty" class="placeholder" style="display:none">
+          <span class="placeholder-icon"><svg><use href="#i-map"/></svg></span>
+          <h2>No mapped cameras yet</h2>
+          <p>Add a camera with latitude/longitude to see it here.</p>
+        </div>
+      </section>
+
       <!-- Generic placeholder for stubs -->
       <section class="page" id="page-stub" style="display:none">
         <div class="placeholder">
@@ -378,11 +400,11 @@
     <aside class="rail">
       <section class="card">
         <header class="card-head">
-          <h2>Recent Alerts</h2>
-          <a class="link" data-route="alerts">View All</a>
+          <h2>Recent Incidents</h2>
+          <a class="link" data-route="incidents">View All</a>
         </header>
         <ul id="alerts-list" class="alert-list">
-          <li class="event-empty">No alerts yet.</li>
+          <li class="event-empty">No incidents yet.</li>
         </ul>
       </section>
 
@@ -476,6 +498,18 @@
         <div class="input-group">
           <label>RTSP URL</label>
           <input name="rtspUrl" placeholder="rtsp://192.168.x.x:554/stream" required>
+        </div>
+        <div class="input-group">
+          <label>
+            Location <span style="color:var(--text-muted);font-weight:400">(optional, used in Maps)</span>
+          </label>
+          <div class="latlng-row">
+            <input name="lat" type="number" step="any" min="-90"  max="90"  placeholder="Latitude">
+            <input name="lng" type="number" step="any" min="-180" max="180" placeholder="Longitude">
+            <button type="button" id="use-my-location" class="btn-secondary" title="Auto-fill from browser geolocation">
+              <svg><use href="#i-map"/></svg>Use my location
+            </button>
+          </div>
         </div>
         <button type="submit" class="btn-primary" style="width:100%">Connect stream</button>
       </form>

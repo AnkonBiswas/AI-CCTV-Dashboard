@@ -1041,6 +1041,92 @@ button { font-family: inherit; }
 .type-badge.type-visitor  { background: rgba(161,161,170,0.18); color: var(--text-secondary); }
 .type-badge.type-standard { background: rgba(16,185,129,0.14); color: var(--success); }
 
+/* ── Snapshot thumbnails (Events / Alerts) ────────────── */
+.event-thumb {
+  width: 44px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  cursor: zoom-in;
+  background: var(--bg);
+  flex-shrink: 0;
+  transition: border-color 0.15s ease;
+}
+.event-thumb:hover { border-color: var(--accent); }
+.event-thumb-cell { width: 56px; height: 40px; }
+
+#snapshot-lightbox { z-index: 1100; cursor: zoom-out; }
+.snapshot-lightbox-box {
+  max-width: 90vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.snapshot-lightbox-box img {
+  max-width: 90vw;
+  max-height: 80vh;
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+}
+.snapshot-lightbox-cap {
+  color: var(--text);
+  font-size: 13px;
+  background: rgba(0,0,0,0.6);
+  padding: 6px 14px;
+  border-radius: 999px;
+}
+
+/* ── Add Camera lat/lng row ───────────────────────────── */
+.latlng-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.latlng-row .btn-secondary {
+  white-space: nowrap;
+  padding: 9px 12px;
+  font-size: 12px;
+}
+.latlng-row .btn-secondary svg { width: 14px; height: 14px; }
+
+/* ── Maps page ────────────────────────────────────────── */
+.map-container {
+  width: 100%;
+  height: calc(100vh - 220px);
+  min-height: 420px;
+  background: var(--bg);
+}
+/* Override Leaflet's default light popup so it matches the dark dashboard. */
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.leaflet-popup-content { margin: 10px 12px; font-family: var(--font); font-size: 13px; }
+.leaflet-popup-content .map-popup-title { font-weight: 600; margin-bottom: 4px; }
+.leaflet-popup-content .map-popup-sub   { margin-bottom: 6px; }
+.leaflet-popup-content .map-popup-rtsp code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+.leaflet-control-attribution {
+  background: rgba(0,0,0,0.6) !important;
+  color: var(--text-muted) !important;
+}
+.leaflet-control-attribution a { color: var(--text-secondary) !important; }
+.leaflet-bar a, .leaflet-bar a:hover {
+  background: var(--bg-card) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+}
+
 /* ── Analytics charts ─────────────────────────────────── */
 .analytics-card { padding: 16px 18px; margin-bottom: 16px; }
 .analytics-card .card-head { margin-bottom: 14px; align-items: baseline; }

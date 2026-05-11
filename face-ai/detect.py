@@ -18,9 +18,17 @@ from facenet_pytorch import InceptionResnetV1
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENROLLMENT_DIR = os.path.join(HERE, 'enrollments')
+SNAPSHOT_DIR   = os.path.join(HERE, 'snapshots')
 FACE_MODEL_PATH = os.path.join(HERE, 'blaze_face_short_range.tflite')
 YOLO_MODEL_PATH = os.path.join(HERE, 'yolov8n.pt') # Standard nano model
 FIRE_MODEL_PATH = os.path.join(HERE, 'fire_model.pt') # Optional custom model
+
+# When fire/smoke or a recognized face appears, save a JPEG of the (full-res)
+# frame with boxes burned in. Throttled per-stream so a steady fire doesn't
+# fill the disk; the same file gets referenced by every incident row from
+# that frame.
+SNAPSHOT_THROTTLE_S = 5.0
+SNAPSHOT_JPEG_QUALITY = 82
 
 FRAME_SKIP = 5               # Process every 5th frame to reduce CPU load
 
@@ -102,6 +110,63 @@ def embed_face(crop_bgr):
     with _face_net_lock, torch.no_grad():
         emb = _face_net(t.to(_torch_device))
     return emb.cpu().numpy().flatten()
+
+
+# ── Snapshot writer (triggered on incidents / recognized faces) ─
+def save_snapshot(stream_id, frame, detections, incidents):
+    """Burn detection boxes onto the full-res frame and write JPEG.
+
+    Returns a relative path (`<streamId>/<ts>.jpg`) that the backend stores
+    in `incidents.snapshot_path` and serves via /snapshot/:streamId/:file.
+    """
+    if frame is None or frame.size == 0:
+        return None
+    h, w = frame.shape[:2]
+    img = frame.copy()
+
+    # Recognized faces / persons (regular detections).
+    for d in (detections or []):
+        x1 = int(max(0, d['x']) * w)
+        y1 = int(max(0, d['y']) * h)
+        x2 = int(min(1, d['x'] + d['w']) * w)
+        y2 = int(min(1, d['y'] + d['h']) * h)
+        if d.get('name'):
+            color = (16, 185, 129)  # emerald BGR-ish
+            label = d['name']
+        elif d.get('label') == 'person':
+            color = (11, 158, 245)  # amber
+            label = 'person'
+        else:
+            color = (246, 130, 59)  # face
+            label = 'face'
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(img, label, (x1, max(15, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+
+    # Fire/smoke incidents (corners format).
+    for inc in (incidents or []):
+        bx = inc.get('box') or []
+        if len(bx) < 4: continue
+        x1 = int(max(0, bx[0]) * w); y1 = int(max(0, bx[1]) * h)
+        x2 = int(min(1, bx[2]) * w); y2 = int(min(1, bx[3]) * h)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (68, 68, 239), 3)
+        cv2.putText(img, str(inc.get('type', 'alert')).upper(),
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (68, 68, 239), 2, cv2.LINE_AA)
+
+    stream_dir = os.path.join(SNAPSHOT_DIR, stream_id)
+    try: os.makedirs(stream_dir, exist_ok=True)
+    except OSError: return None
+
+    ts_ms = int(time.time() * 1000)
+    fname = f'{ts_ms}.jpg'
+    abs_path = os.path.join(stream_dir, fname)
+    try:
+        cv2.imwrite(abs_path, img, [cv2.IMWRITE_JPEG_QUALITY, SNAPSHOT_JPEG_QUALITY])
+    except Exception as ex:
+        log({'type': 'warning', 'message': f'snapshot write failed: {ex}'})
+        return None
+    return f'{stream_id}/{fname}'
 
 
 # ── Per-directory recognizers ───────────────────────────────────
@@ -242,6 +307,7 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
     enrolled_mtime = 0
     last_seen_id = 0
     last_processed_at = 0
+    last_snapshot_at  = 0
     period = 1.0 / TARGET_FPS
 
     # For incident heuristics (e.g. fight)
@@ -423,7 +489,23 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
             except Exception as ex:
                 log({'type': 'warning', 'message': f'YOLO error: {ex}'})
 
-            log({'type': 'detections', 'streamId': stream_id, 'detections': detections, 'incidents': incidents})
+            # Snapshot trigger: any incident OR any recognized (named) face.
+            # Throttle per stream so a steady event doesn't fill the disk.
+            snapshot_path = None
+            should_snap = bool(incidents) or any(d.get('name') for d in detections)
+            now_t = time.time()
+            if should_snap and (now_t - last_snapshot_at) >= SNAPSHOT_THROTTLE_S:
+                snapshot_path = save_snapshot(stream_id, frame, detections, incidents)
+                if snapshot_path:
+                    last_snapshot_at = now_t
+
+            log({
+                'type': 'detections',
+                'streamId': stream_id,
+                'detections': detections,
+                'incidents': incidents,
+                'snapshot': snapshot_path,
+            })
     finally:
         reader.stop()
         log({'type': 'info', 'message': f'Stream worker stopped: {stream_id}'})

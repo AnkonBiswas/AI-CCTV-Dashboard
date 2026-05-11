@@ -150,10 +150,14 @@ function connectSocket() {
   });
 
   socket.on('incident_logged', (row) => {
+    // Dashboard "Recent Events" card shows all detection types.
     prependEvent(row);
-    prependAlert(row);
-    bumpBadge('bell-badge');
-    bumpBadge('nav-events-badge');
+    // "Recent Incidents" rail + bell + nav badge are strictly fire/smoke.
+    if (isIncident(row)) {
+      prependAlert(row);
+      bumpBadge('bell-badge');
+      bumpBadge('nav-incidents-badge');
+    }
   });
 
   socket.on('agent_status', ({ message }) => {
@@ -763,11 +767,11 @@ function screenshotTile(streamId) {
   }
 }
 
-async function addCamera({ cameraName, rtspUrl }) {
+async function addCamera({ cameraName, rtspUrl, lat, lng }) {
   const r = await authedFetch(`${API}/add-camera`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ cameraName, rtspUrl }),
+    body: JSON.stringify({ cameraName, rtspUrl, lat, lng }),
   });
   if (!r.ok) { alert(`Add camera failed: ${await r.text()}`); return; }
   const { streamId, hlsUrl, streamKey, agentStarted } = await r.json();
@@ -870,6 +874,48 @@ function eventIconHtml(type) {
   return `<span class="event-icon ${type}"><svg><use href="${symId}"/></svg></span>`;
 }
 
+function snapshotUrl(snapshot) {
+  if (!snapshot) return null;
+  // snapshot path comes from the AI worker as "<streamId>/<file>.jpg".
+  // Route mounts on /snapshot/:streamId/:file so we just concat.
+  return `${API}/snapshot/${snapshot}?token=${encodeURIComponent(token)}`;
+}
+
+// Lightboxes for full-size snapshot view on click.
+function openSnapshotLightbox(url, caption) {
+  let box = document.getElementById('snapshot-lightbox');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'snapshot-lightbox';
+    box.className = 'modal-overlay';
+    box.innerHTML = `
+      <div class="snapshot-lightbox-box">
+        <img alt="Snapshot">
+        <div class="snapshot-lightbox-cap"></div>
+      </div>`;
+    box.addEventListener('click', () => { box.style.display = 'none'; });
+    document.body.appendChild(box);
+  }
+  box.querySelector('img').src = url;
+  box.querySelector('.snapshot-lightbox-cap').textContent = caption || '';
+  box.style.display = 'flex';
+}
+
+function snapshotThumbEl(snapshot, caption) {
+  if (!snapshot) return null;
+  const img = document.createElement('img');
+  img.className = 'event-thumb';
+  img.src = snapshotUrl(snapshot);
+  img.alt = caption || 'snapshot';
+  img.title = caption || 'Snapshot';
+  img.loading = 'lazy';
+  img.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openSnapshotLightbox(img.src, caption);
+  });
+  return img;
+}
+
 function buildEventRow(row) {
   const li = document.createElement('li');
   li.innerHTML = `
@@ -887,6 +933,9 @@ function buildEventRow(row) {
     sub.textContent = '· ' + (row.name ? `${row.name} @ ${row.cameraName || ''}` : row.cameraName);
     text.appendChild(sub);
   }
+  const thumb = snapshotThumbEl(row.snapshot,
+    `${EVENT_TITLES[row.type] || row.type} · ${row.cameraName || ''}`);
+  if (thumb) li.insertBefore(thumb, li.querySelector('.event-time'));
   li.querySelector('.event-time').textContent = fmtTime(row.createdAt);
   return li;
 }
@@ -913,6 +962,9 @@ function buildAlertRow(row) {
   li.querySelector('.alert-title').textContent = EVENT_TITLES[row.type] || row.type;
   const sub = li.querySelector('.alert-sub');
   sub.textContent = row.name ? `${row.name} · ${row.cameraName || ''}` : (row.cameraName || row.streamId);
+  const thumb = snapshotThumbEl(row.snapshot,
+    `${EVENT_TITLES[row.type] || row.type} · ${row.cameraName || ''}`);
+  if (thumb) li.insertBefore(thumb, li.querySelector('.alert-time'));
   li.querySelector('.alert-time').textContent = fmtTime(row.createdAt);
   return li;
 }
@@ -1113,28 +1165,49 @@ function readFilesAsDataURLs(fileList) {
 }
 
 // ── Events / Alerts page ─────────────────────────────────
-async function refreshEventsTable() {
-  const tbody = document.querySelector('#events-table tbody');
+function incidentTitle(row) {
+  if (row.type === 'face' && row.name) return `Face Recognized`;
+  return EVENT_TITLES[row.type] || row.type;
+}
+function incidentIconSym(row) {
+  if (row.type === 'fire' || row.type === 'smoke') return '#i-fire';
+  if (row.type === 'face') return '#i-users';
+  return '#i-bell';
+}
+
+async function refreshIncidentsTable() {
+  const tbody = document.querySelector('#incidents-table tbody');
   if (!tbody) return;
-  const list = await (await authedFetch(`${API}/incidents?limit=200`)).json();
+  const list = await (await authedFetch(`${API}/incidents?limit=200&incidentsOnly=true`)).json();
   tbody.innerHTML = '';
+  if (list.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:24px;font-style:italic">No incidents recorded yet — fire, smoke and recognized-face alerts will appear here.</td></tr>`;
+    return;
+  }
   for (const row of list) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td></td><td></td><td></td><td></td><td></td>`;
+    tr.innerHTML = `<td></td><td></td><td></td><td></td><td></td><td></td>`;
+
+    const thumb = snapshotThumbEl(row.snapshot,
+      `${incidentTitle(row)} · ${row.cameraName || ''}`);
+    if (thumb) {
+      thumb.classList.add('event-thumb-cell');
+      tr.children[0].appendChild(thumb);
+    } else {
+      tr.children[0].textContent = '—';
+      tr.children[0].style.color = 'var(--text-muted)';
+    }
+
     const typeCell = document.createElement('span');
     typeCell.className = `event-icon ${row.type}`;
     typeCell.style.display = 'inline-grid';
-    typeCell.innerHTML = `<svg><use href="${
-      row.type === 'fire' || row.type === 'smoke' ? '#i-fire'
-      : row.type === 'face' ? '#i-users'
-      : '#i-running'
-    }"/></svg>`;
-    tr.children[0].appendChild(typeCell);
-    tr.children[0].appendChild(document.createTextNode(' ' + (EVENT_TITLES[row.type] || row.type)));
-    tr.children[1].textContent = row.cameraName || row.streamId;
-    tr.children[2].textContent = row.name || '—';
-    tr.children[3].textContent = row.confidence != null ? `${Math.round(row.confidence * 100)}%` : '—';
-    tr.children[4].textContent = fmtTime(row.createdAt);
+    typeCell.innerHTML = `<svg><use href="${incidentIconSym(row)}"/></svg>`;
+    tr.children[1].appendChild(typeCell);
+    tr.children[1].appendChild(document.createTextNode(' ' + incidentTitle(row)));
+    tr.children[2].textContent = row.cameraName || row.streamId;
+    tr.children[3].textContent = row.name || '—';
+    tr.children[4].textContent = row.confidence != null ? `${Math.round(row.confidence * 100)}%` : '—';
+    tr.children[5].textContent = fmtTime(row.createdAt);
     tbody.appendChild(tr);
   }
 }
@@ -1177,21 +1250,27 @@ async function refreshFeatures() {
 
 // ── Initial-load fillers for events & alerts ─────────────
 async function loadInitialEvents() {
-  const list = await (await authedFetch(`${API}/incidents?limit=20`)).json();
+  // Dashboard "Recent Events" card: all detection types (face/person/fire/smoke).
+  const allList = await (await authedFetch(`${API}/incidents?limit=20`)).json();
+  // Recent Incidents rail + badges: fire/smoke OR recognized faces.
+  const incidentList = await (await authedFetch(`${API}/incidents?limit=20&incidentsOnly=true`)).json();
+
   const ev = document.getElementById('event-list');
   const al = document.getElementById('alerts-list');
   ev.innerHTML = ''; al.innerHTML = '';
-  if (list.length === 0) {
+
+  if (allList.length === 0) {
     ev.innerHTML = '<li class="event-empty">No events yet.</li>';
-    al.innerHTML = '<li class="event-empty">No alerts yet.</li>';
-    setBadge('bell-badge', 0);
-    setBadge('nav-events-badge', 0);
-    return;
+  } else {
+    for (const row of allList.slice(0, MAX_EVENTS)) ev.appendChild(buildEventRow(row));
   }
-  for (const row of list.slice(0, MAX_EVENTS))  ev.appendChild(buildEventRow(row));
-  for (const row of list.slice(0, MAX_ALERTS)) al.appendChild(buildAlertRow(row));
-  setBadge('bell-badge', list.length);
-  setBadge('nav-events-badge', list.length);
+  if (incidentList.length === 0) {
+    al.innerHTML = '<li class="event-empty">No incidents yet.</li>';
+  } else {
+    for (const row of incidentList.slice(0, MAX_ALERTS)) al.appendChild(buildAlertRow(row));
+  }
+  setBadge('bell-badge', incidentList.length);
+  setBadge('nav-incidents-badge', incidentList.length);
 }
 
 // ── Analytics ────────────────────────────────────────────
@@ -1440,6 +1519,92 @@ function renderHorizontalBars(elId, rows, labelKey, valueKey) {
   }
 }
 
+// ── Maps page (Leaflet) ──────────────────────────────────
+let mapInstance = null;
+let mapMarkers = [];
+
+function ensureMap() {
+  if (mapInstance) return mapInstance;
+  if (typeof L === 'undefined') {
+    document.getElementById('map-container').innerHTML =
+      '<div class="chart-empty">Leaflet failed to load.</div>';
+    return null;
+  }
+  mapInstance = L.map('map-container', {
+    zoomControl: true,
+    worldCopyJump: true,
+  }).setView([0, 0], 2);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '© OpenStreetMap',
+  }).addTo(mapInstance);
+  return mapInstance;
+}
+
+function clearMapMarkers() {
+  for (const m of mapMarkers) m.remove();
+  mapMarkers = [];
+}
+
+async function refreshMapPage() {
+  const list = await (await authedFetch(`${API}/cameras`)).json();
+  const located = list.filter((c) => typeof c.lat === 'number' && typeof c.lng === 'number');
+  const empty = document.getElementById('map-empty');
+  const wrap = document.getElementById('map-container').parentElement;
+
+  if (located.length === 0) {
+    if (empty) empty.style.display = '';
+    if (wrap) wrap.style.display = 'none';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  if (wrap) wrap.style.display = '';
+
+  const map = ensureMap();
+  if (!map) return;
+  // Leaflet only sizes correctly once the container has width — invalidate
+  // after the first paint so the tiles render in the right place.
+  setTimeout(() => map.invalidateSize(), 50);
+
+  clearMapMarkers();
+  const bounds = L.latLngBounds([]);
+  for (const c of located) {
+    const live = cameras.get(c.streamId);
+    const state = live?.state || 'unknown';
+    const marker = L.marker([c.lat, c.lng]).addTo(map);
+    const popup = `
+      <div class="map-popup">
+        <div class="map-popup-title">${escapeHtml(c.cameraName)}</div>
+        <div class="map-popup-sub">
+          <span class="status-pill ${state}"><span class="dot"></span>${stateLabel(state)}</span>
+        </div>
+        <div class="map-popup-rtsp"><code>${escapeHtml(c.rtspUrl)}</code></div>
+      </div>`;
+    marker.bindPopup(popup);
+    mapMarkers.push(marker);
+    bounds.extend([c.lat, c.lng]);
+  }
+  if (located.length === 1) {
+    map.setView([located[0].lat, located[0].lng], 16);
+  } else {
+    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 });
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function stateLabel(s) {
+  return s === 'live' ? 'Live' : s === 'connecting' ? 'Connecting' : s === 'offline' ? 'Offline' : '—';
+}
+
+document.getElementById('map-fit-all')?.addEventListener('click', () => {
+  if (!mapInstance || mapMarkers.length === 0) return;
+  const bounds = L.latLngBounds(mapMarkers.map((m) => m.getLatLng()));
+  mapInstance.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 });
+});
+
 async function refreshAnalyticsCharts() {
   const sel = document.getElementById('analytics-charts-period');
   const days = Number(sel?.value || 7);
@@ -1461,15 +1626,18 @@ const PAGES = {
   dashboard: 'page-dashboard', live: 'page-dashboard',
   cameras:   'page-cameras',
   users:     'page-users',
-  events:    'page-events',
-  alerts:    'page-events',
+  incidents: 'page-incidents',
   analytics: 'page-analytics',
+  maps:      'page-maps',
   settings:  'page-settings',
 };
-const PAGE_TITLES = {
-  events: 'Events',
-  alerts: 'Recent Alerts',
-};
+// "Incident" rules — what shows up on the Incidents page and Recent
+// Incidents rail. Fire/smoke always count; face detections count only when
+// the recognizer matched a name. Unnamed faces and motion (person) events
+// flow into the dashboard's "Recent Events" card but not here.
+const isIncident = (row) =>
+  !!row && (row.type === 'fire' || row.type === 'smoke' ||
+            (row.type === 'face' && !!row.name));
 
 function showRoute(route) {
   const target = PAGES[route] || 'page-stub';
@@ -1484,11 +1652,11 @@ function showRoute(route) {
   if (route === 'users')     refreshEnrollments();
   if (route === 'settings')  refreshFeatures();
   if (route === 'analytics') refreshAnalyticsCharts();
-  if (route === 'events' || route === 'alerts') {
-    document.getElementById('events-title').textContent = PAGE_TITLES[route];
-    refreshEventsTable();
+  if (route === 'maps')      refreshMapPage();
+  if (route === 'incidents') {
+    refreshIncidentsTable();
     setBadge('bell-badge', 0);
-    setBadge('nav-events-badge', 0);
+    setBadge('nav-incidents-badge', 0);
   }
 }
 
@@ -1519,9 +1687,43 @@ document.getElementById('add-person-btn')?.addEventListener('click', openAddPers
 document.getElementById('add-camera-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
-  await addCamera({ cameraName: fd.get('cameraName'), rtspUrl: fd.get('rtspUrl') });
+  const latRaw = fd.get('lat');
+  const lngRaw = fd.get('lng');
+  await addCamera({
+    cameraName: fd.get('cameraName'),
+    rtspUrl:    fd.get('rtspUrl'),
+    lat:        latRaw === '' || latRaw == null ? null : Number(latRaw),
+    lng:        lngRaw === '' || lngRaw == null ? null : Number(lngRaw),
+  });
   e.target.reset();
   closeModal('add-camera-modal');
+});
+
+// "Use my location" — fills lat/lng from the browser's geolocation API.
+document.getElementById('use-my-location')?.addEventListener('click', () => {
+  if (!navigator.geolocation) {
+    alert('This browser does not expose geolocation.');
+    return;
+  }
+  const btn = document.getElementById('use-my-location');
+  const old = btn.innerHTML;
+  btn.disabled = true;
+  btn.textContent = 'Locating…';
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      const form = document.getElementById('add-camera-form');
+      form.elements.lat.value = pos.coords.latitude.toFixed(6);
+      form.elements.lng.value = pos.coords.longitude.toFixed(6);
+      btn.disabled = false;
+      btn.innerHTML = old;
+    },
+    (err) => {
+      alert(`Location unavailable: ${err.message}`);
+      btn.disabled = false;
+      btn.innerHTML = old;
+    },
+    { enableHighAccuracy: true, timeout: 10000 },
+  );
 });
 
 document.getElementById('enroll-form').addEventListener('submit', async (e) => {
@@ -1611,7 +1813,7 @@ document.getElementById('fullscreen-btn').addEventListener('click', () => {
   if (document.fullscreenElement) document.exitFullscreen();
   else document.documentElement.requestFullscreen();
 });
-document.getElementById('bell-btn').addEventListener('click', () => showRoute('alerts'));
+document.getElementById('bell-btn').addEventListener('click', () => showRoute('incidents'));
 document.getElementById('grid-size').addEventListener('change', (e) => {
   grid.classList.remove('grid-1', 'grid-2', 'grid-3', 'grid-4', 'grid-auto');
   grid.classList.add(`grid-${e.target.value}`);

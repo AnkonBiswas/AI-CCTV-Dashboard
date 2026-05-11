@@ -92,8 +92,9 @@ async function getUserFeatures(userId) {
 }
 
 // ── Incident persistence with per-(stream,type,name) throttle ─
+const SNAPSHOT_ROOT = path.join(__dirname, '..', 'face-ai', 'snapshots');
 const lastIncidentAt = new Map();
-async function persistIncidents(streamId, detections, incidents) {
+async function persistIncidents(streamId, detections, incidents, snapshotPath) {
   const stream = activeStreams.get(streamId);
   if (!stream) return;
   const { userId, cameraName } = stream;
@@ -128,11 +129,13 @@ async function persistIncidents(streamId, detections, incidents) {
     lastIncidentAt.set(key, now);
     try {
       await db.getPool().query(
-        'INSERT INTO incidents (user_id, stream_id, camera_name, type, name, confidence, bbox_json) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [userId, streamId, cameraName, c.type, c.name, c.confidence ?? null, JSON.stringify(c.bbox)],
+        'INSERT INTO incidents (user_id, stream_id, camera_name, type, name, confidence, bbox_json, snapshot_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [userId, streamId, cameraName, c.type, c.name, c.confidence ?? null, JSON.stringify(c.bbox), snapshotPath || null],
       );
       emitToUser(userId, 'incident_logged', {
-        streamId, cameraName, type: c.type, name: c.name, createdAt: new Date().toISOString(),
+        streamId, cameraName, type: c.type, name: c.name,
+        snapshot: snapshotPath || null,
+        createdAt: new Date().toISOString(),
       });
     } catch (err) {
       console.error('[DB] Insert incident failed:', err.message);
@@ -173,7 +176,7 @@ function startMasterWorker() {
               }
             }).catch((err) => console.error('[detections] augment failed:', err.message));
           }
-          persistIncidents(msg.streamId, msg.detections, msg.incidents).catch(() => {});
+          persistIncidents(msg.streamId, msg.detections, msg.incidents, msg.snapshot).catch(() => {});
         } else {
           console.log(`[AI] ${msg.type}: ${msg.message || line}`);
         }
@@ -294,20 +297,30 @@ async function teardownCameraStack(streamId) {
 }
 
 // ── Camera routes (user-scoped) ───────────────────────────────
+function parseCoord(v, min, max) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!isFinite(n) || n < min || n > max) return null;
+  return n;
+}
+
 app.post('/add-camera', async (req, res) => {
   const userId = req.user.uid;
   const { rtspUrl, cameraName } = req.body || {};
   if (!rtspUrl || !cameraName) {
     return res.status(400).json({ error: 'rtspUrl and cameraName are required' });
   }
+  // Coordinates are optional but, if supplied, must be valid WGS-84 ranges.
+  const lat = parseCoord(req.body.lat, -90, 90);
+  const lng = parseCoord(req.body.lng, -180, 180);
 
   const streamId = uuidv4();
   const pathName = `camera_${streamId.replace(/-/g, '_')}`;
 
   try {
     await db.getPool().query(
-      'INSERT INTO cameras (user_id, stream_id, camera_name, rtsp_url, path_name) VALUES (?, ?, ?, ?, ?)',
-      [userId, streamId, cameraName, rtspUrl, pathName],
+      'INSERT INTO cameras (user_id, stream_id, camera_name, rtsp_url, path_name, lat, lng) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [userId, streamId, cameraName, rtspUrl, pathName, lat, lng],
     );
   } catch (err) {
     return res.status(500).json({ error: `db insert failed: ${err.message}` });
@@ -346,10 +359,34 @@ app.delete('/camera/:id', async (req, res) => {
 app.get('/cameras', async (req, res) => {
   const userId = req.user.uid;
   const [rows] = await db.getPool().query(
-    'SELECT stream_id AS streamId, camera_name AS cameraName, rtsp_url AS rtspUrl, path_name AS pathName FROM cameras WHERE user_id = ?',
+    'SELECT stream_id AS streamId, camera_name AS cameraName, rtsp_url AS rtspUrl, path_name AS pathName, lat, lng FROM cameras WHERE user_id = ?',
     [userId],
   );
-  res.json(rows.map((r) => ({ ...r, hlsUrl: `${HLS_BASE}/${r.pathName}/` })));
+  res.json(rows.map((r) => ({
+    ...r,
+    lat: r.lat == null ? null : Number(r.lat),
+    lng: r.lng == null ? null : Number(r.lng),
+    hlsUrl: `${HLS_BASE}/${r.pathName}/`,
+  })));
+});
+
+// Update an existing camera's location (used by the map's "drag pin" UX
+// or by editing the camera in the Cameras table).
+app.put('/camera/:id', async (req, res) => {
+  const userId = req.user.uid;
+  const { id } = req.params;
+  const lat = parseCoord(req.body?.lat, -90, 90);
+  const lng = parseCoord(req.body?.lng, -180, 180);
+  try {
+    const [r] = await db.getPool().query(
+      'UPDATE cameras SET lat = ?, lng = ? WHERE stream_id = ? AND user_id = ?',
+      [lat, lng, id, userId],
+    );
+    if (r.affectedRows === 0) return res.status(404).json({ error: 'camera not found' });
+    res.json({ streamId: id, lat, lng });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Enrollment routes (user-scoped) ───────────────────────────
@@ -600,6 +637,48 @@ app.put('/features/:name', async (req, res) => {
   }
 });
 
+// ── Snapshot serving (ownership-checked) ──────────────────────
+// Stored on disk as face-ai/snapshots/<streamId>/<ts>.jpg by the AI worker.
+// We verify the requesting user owns the stream (live activeStreams first,
+// then the cameras DB) before serving the file. Strict pathing so a bad
+// streamId/filename can't escape SNAPSHOT_ROOT.
+app.get('/snapshot/:streamId/:file', async (req, res) => {
+  const userId = req.user.uid;
+  const { streamId, file } = req.params;
+  if (!/^[A-Za-z0-9._-]+$/.test(streamId) || !/^[\d._-]+\.jpg$/i.test(file)) {
+    return res.status(400).json({ error: 'invalid path' });
+  }
+
+  // Ownership check: try in-memory first (covers live cameras + demo seeds),
+  // fall back to DB so we still serve snapshots after a backend restart.
+  let owned = activeStreams.get(streamId)?.userId === userId;
+  if (!owned) {
+    try {
+      const [rows] = await db.getPool().query(
+        'SELECT 1 FROM cameras WHERE stream_id = ? AND user_id = ? LIMIT 1',
+        [streamId, userId],
+      );
+      owned = rows.length > 0;
+    } catch { /* ignore */ }
+  }
+  if (!owned) {
+    // Also tolerate snapshots written for cameras that have since been
+    // removed: if any incident with this snapshot belongs to the user, allow.
+    try {
+      const [rows] = await db.getPool().query(
+        'SELECT 1 FROM incidents WHERE user_id = ? AND snapshot_path = ? LIMIT 1',
+        [userId, `${streamId}/${file}`],
+      );
+      owned = rows.length > 0;
+    } catch { /* ignore */ }
+  }
+  if (!owned) return res.status(404).end();
+
+  const abs = path.join(SNAPSHOT_ROOT, streamId, file);
+  if (!abs.startsWith(SNAPSHOT_ROOT + path.sep)) return res.status(400).end();
+  res.sendFile(abs, (err) => { if (err && !res.headersSent) res.status(404).end(); });
+});
+
 // ── Incidents (user-scoped) ───────────────────────────────────
 app.get('/incidents', async (req, res) => {
   const userId = req.user.uid;
@@ -608,9 +687,25 @@ app.get('/incidents', async (req, res) => {
   const where = ['user_id = ?'];
   const params = [userId];
   if (streamId) { where.push('stream_id = ?'); params.push(streamId); }
-  if (type)     { where.push('type = ?');      params.push(type); }
+  if (type) {
+    // Accept comma-separated list so callers can ask for ?type=fire,smoke
+    // without firing two requests. Single values still work as before.
+    const types = String(type).split(',').map((t) => t.trim()).filter(Boolean);
+    if (types.length === 1) {
+      where.push('type = ?'); params.push(types[0]);
+    } else if (types.length > 1) {
+      where.push(`type IN (${types.map(() => '?').join(',')})`);
+      params.push(...types);
+    }
+  }
   if (since)    { where.push('created_at >= ?'); params.push(new Date(since)); }
-  const sql = `SELECT id, stream_id AS streamId, camera_name AS cameraName, type, name, confidence, bbox_json AS bbox, created_at AS createdAt
+  // "Incidents" filter: fire/smoke OR a recognized (named) face. Unnamed
+  // face detections and motion (person) events are excluded — those live
+  // in the dashboard's general "Recent Events" feed instead.
+  if (req.query.incidentsOnly === 'true' || req.query.incidentsOnly === '1') {
+    where.push("(type IN ('fire','smoke') OR (type = 'face' AND name IS NOT NULL AND name <> ''))");
+  }
+  const sql = `SELECT id, stream_id AS streamId, camera_name AS cameraName, type, name, confidence, bbox_json AS bbox, snapshot_path AS snapshot, created_at AS createdAt
                FROM incidents WHERE ${where.join(' AND ')}
                ORDER BY created_at DESC LIMIT ?`;
   params.push(limit);
@@ -781,18 +876,39 @@ app.get('/analytics-charts', async (req, res) => {
 });
 
 // ── Bootstrap persisted cameras on startup ────────────────────
+// Cameras whose RTSP URL starts with this prefix are treated as decorative
+// demo data (used to populate the Maps page on a fresh install). They get
+// registered in-memory so /cameras and the map work, but no agent/AI/MediaMTX
+// path is created — there's nothing real to bridge.
+const DEMO_RTSP_PREFIX = 'rtsp://demo.';
+
 async function bootstrapCamerasFromDb() {
   const [rows] = await db.getPool().query(
     'SELECT user_id AS userId, stream_id AS streamId, camera_name AS cameraName, rtsp_url AS rtspUrl, path_name AS pathName FROM cameras',
   );
+  let real = 0, demo = 0;
   for (const c of rows) {
+    if (typeof c.rtspUrl === 'string' && c.rtspUrl.startsWith(DEMO_RTSP_PREFIX)) {
+      activeStreams.set(c.streamId, {
+        userId: c.userId,
+        cameraName: c.cameraName,
+        rtspUrl: c.rtspUrl,
+        pathName: c.pathName,
+        hlsUrl: `${HLS_BASE}/${c.pathName}/`,
+      });
+      demo++;
+      continue;
+    }
     try {
       await spawnCameraStack(c);
+      real++;
     } catch (err) {
       console.error(`[Backend] Failed to restore camera ${c.cameraName}:`, err.response?.data || err.message);
     }
   }
-  if (rows.length) console.log(`[Backend] Restored ${rows.length} camera(s) from DB`);
+  if (real || demo) {
+    console.log(`[Backend] Restored ${real} live + ${demo} demo camera(s) from DB`);
+  }
 }
 
 // ── Shutdown ──────────────────────────────────────────────────
