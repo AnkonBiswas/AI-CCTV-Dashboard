@@ -1078,7 +1078,7 @@ app.get('/person/:name/activity', async (req, res) => {
     for (const r of byHourRaw) byHour[r.hour] = Number(r.n);
 
     const [byDay] = await pool.query(
-      `SELECT DATE(created_at) AS day, COUNT(*) AS n
+      `SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS day, COUNT(*) AS n
        FROM incidents WHERE ${baseWhere}
        GROUP BY day ORDER BY day`,
       baseArgs,
@@ -1118,7 +1118,7 @@ app.get('/person/:name/activity', async (req, res) => {
       byCamera,
       byHour,
       byDay: byDay.map((d) => ({
-        day: (d.day instanceof Date) ? d.day.toISOString().slice(0, 10) : String(d.day).slice(0, 10),
+        day: String(d.day),
         n: Number(d.n),
       })),
       timeline: timeline.map((r) => ({
@@ -1175,7 +1175,7 @@ app.get('/analytics-charts', async (req, res) => {
       [userId, since],
     );
     const [daily] = await pool.query(
-      `SELECT DATE(created_at) AS day, COUNT(*) AS n,
+      `SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS day, COUNT(*) AS n,
               SUM(CASE WHEN type IN ('fire','smoke') THEN 1 ELSE 0 END) AS alerts
        FROM incidents
        WHERE user_id = ? AND created_at >= ?
@@ -1191,7 +1191,7 @@ app.get('/analytics-charts', async (req, res) => {
       byCamera,
       byPerson,
       daily: daily.map((d) => ({
-        day: (d.day instanceof Date) ? d.day.toISOString().slice(0, 10) : String(d.day).slice(0, 10),
+        day: String(d.day),
         n: Number(d.n),
         alerts: Number(d.alerts || 0),
       })),
@@ -1222,7 +1222,7 @@ app.get('/analytics-daywise', async (req, res) => {
   try {
     await pool.query('SET SESSION group_concat_max_len = 32768');
     const [rows] = await pool.query(
-      `SELECT DATE(created_at) AS day,
+      `SELECT DATE_FORMAT(created_at, '%Y-%m-%d') AS day,
               name,
               COUNT(*) AS n,
               MIN(created_at) AS firstSeen,
@@ -1239,7 +1239,7 @@ app.get('/analytics-daywise', async (req, res) => {
     res.json({
       days,
       rows: rows.map((r) => ({
-        day: (r.day instanceof Date) ? r.day.toISOString().slice(0, 10) : String(r.day).slice(0, 10),
+        day: String(r.day),
         name: r.name,
         nameKey: String(r.name).replace(/ /g, '_'),
         n: Number(r.n),

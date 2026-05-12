@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { StrictMode, useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider, createRouter } from "@tanstack/react-router";
@@ -34,6 +34,13 @@ declare module "@tanstack/react-router" {
 
 function InnerApp() {
   const auth = useAuth();
+  // beforeLoad only fires on navigation, so a token change (login/logout)
+  // while staying on the same route won't re-trigger the auth guards.
+  // Invalidate the router so every active route re-runs its beforeLoad,
+  // which then redirects to /login (or out of /login) as appropriate.
+  useEffect(() => {
+    void router.invalidate();
+  }, [auth.token]);
   return <RouterProvider router={router} context={{ queryClient, auth }} />;
 }
 

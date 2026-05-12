@@ -165,7 +165,7 @@ function PersonActivityPage() {
               <div key={t.id} className="px-4 py-3 flex gap-3">
                 {t.snapshot ? (
                   <img
-                    src={buildAssetUrl(`/snapshot/${encodeURIComponent(t.cameraName)}/${t.snapshot}`)}
+                    src={buildAssetUrl(`/snapshot/${t.snapshot}`)}
                     alt=""
                     className="size-12 rounded border border-border object-cover"
                     onError={(e) => {

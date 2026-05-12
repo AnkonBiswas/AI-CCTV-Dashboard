@@ -104,7 +104,7 @@ function IncidentsPage() {
                         className="block size-12 rounded overflow-hidden border border-border"
                       >
                         <img
-                          src={buildAssetUrl(`/snapshot/${r.streamId}/${r.snapshot}`)}
+                          src={buildAssetUrl(`/snapshot/${r.snapshot}`)}
                           alt=""
                           className="w-full h-full object-cover"
                           onError={(e) => {
@@ -155,7 +155,7 @@ function IncidentsPage() {
           </button>
           <div className="max-w-5xl w-full" onClick={(e) => e.stopPropagation()}>
             <img
-              src={buildAssetUrl(`/snapshot/${lightbox.streamId}/${lightbox.snapshot}`)}
+              src={buildAssetUrl(`/snapshot/${lightbox.snapshot}`)}
               alt=""
               className="w-full max-h-[80vh] object-contain rounded-lg border border-border"
             />
