@@ -18,7 +18,7 @@ export const Route = createFileRoute("/_app/")({
 function Dashboard() {
   const cameras = useCameras();
   const analytics = useAnalytics("today");
-  const charts = useAnalyticsCharts(1);
+  const charts = useAnalyticsCharts(7);
   const daywise = useAnalyticsDaywise(7);
   const recent = useIncidents({ limit: 8, incidentsOnly: false, refetchInterval: 15_000 });
 
@@ -115,7 +115,7 @@ function Dashboard() {
                     Hourly Detection Flux
                   </div>
                   <div className="mt-1 text-sm font-semibold">
-                    Today's people movement across all cameras
+                    Rolling 7-day people movement, bucketed by hour
                   </div>
                 </div>
                 <Link to="/attendance" className="text-xs text-primary flex items-center gap-1 hover:underline">
@@ -147,16 +147,18 @@ function Dashboard() {
 
             <Link
               to="/heatmap"
-              className="bg-panel border border-border rounded-xl overflow-hidden relative group hover:border-primary/40 transition flex items-end p-5"
+              className="bg-panel border border-border rounded-xl overflow-hidden relative group hover:border-primary/40 transition min-h-[180px]"
             >
-              <div>
-                <div className="text-[10px] uppercase tracking-widest text-mono text-primary">
-                  Heatmap
+              <HeatmapThumb cells={charts.data?.heatmap ?? []} />
+              <div className="absolute inset-0 bg-gradient-to-t from-background via-background/50 to-transparent pointer-events-none" />
+              <div className="absolute inset-x-0 bottom-0 p-5 flex items-end justify-between">
+                <div>
+                  <div className="text-[10px] uppercase tracking-widest text-mono text-primary">
+                    Heatmap
+                  </div>
+                  <div className="text-sm font-semibold mt-1">Density Hotspots</div>
                 </div>
-                <div className="text-sm font-semibold mt-1 flex items-center justify-between">
-                  Density Hotspots
-                  <ArrowUpRight className="size-3.5 group-hover:translate-x-0.5 transition" />
-                </div>
+                <ArrowUpRight className="size-3.5 text-muted-foreground group-hover:translate-x-0.5 group-hover:text-foreground transition" />
               </div>
             </Link>
           </div>
@@ -288,4 +290,35 @@ function formatDelta(n: number): string {
   if (!isFinite(n)) return "—";
   const sign = n > 0 ? "↑" : n < 0 ? "↓" : "·";
   return `${sign} ${Math.abs(n).toFixed(1)}%`;
+}
+
+// Mini day-of-week × hour density grid, sized to fill its parent. Shows the
+// same shape as /heatmap so the live monitor preview is faithful.
+function HeatmapThumb({ cells }: { cells: { dow: number; hour: number; n: number }[] }) {
+  const grid: number[][] = Array.from({ length: 7 }, () => Array(24).fill(0));
+  for (const c of cells) {
+    // Backend `dow` is MySQL's 0=Sun..6=Sat; rotate to Mon-first so the row
+    // order matches the full Heatmap page and reads workweek-first.
+    const row = c.dow === 0 ? 6 : c.dow - 1;
+    grid[row][c.hour] = c.n;
+  }
+  const max = Math.max(1, ...grid.flat());
+
+  return (
+    <div
+      className="absolute inset-0 p-3 grid gap-px"
+      style={{ gridTemplateColumns: "repeat(24, minmax(0, 1fr))", gridTemplateRows: "repeat(7, minmax(0, 1fr))" }}
+    >
+      {grid.flatMap((row, di) =>
+        row.map((n, h) => {
+          const t = n / max;
+          const bg =
+            n === 0
+              ? "color-mix(in oklab, var(--panel-elevated) 60%, transparent)"
+              : `color-mix(in oklab, var(--primary) ${Math.max(10, Math.round(t * 90))}%, transparent)`;
+          return <div key={`${di}-${h}`} className="rounded-[2px]" style={{ background: bg }} />;
+        }),
+      )}
+    </div>
+  );
 }
