@@ -45,20 +45,14 @@ fi
 
 # ── Stop anything we'd collide with ──────────────────────────
 echo "[1/4] Cleaning up existing services..."
-pkill -f "mediamtx/mediamtx"          2>/dev/null || true
-pkill -f "node[[:space:]].*server\.js" 2>/dev/null || true
+pkill -f "mediamtx/mediamtx"                                2>/dev/null || true
+pkill -f "node[[:space:]].*server\.js"                      2>/dev/null || true
 pkill -f "python.*-m[[:space:]]http\.server[[:space:]]8080" 2>/dev/null || true
+pkill -f "vite"                                             2>/dev/null || true
 sleep 1
 
 # ── Start each service in the background, logging to logs/ ───
 PIDS=()
-start_service() {
-  local name="$1"; shift
-  local log="$LOG_DIR/$name.log"
-  echo "[$name] starting (log: $log)"
-  ( "$@" ) >"$log" 2>&1 &
-  PIDS+=("$!")
-}
 
 echo "[2/4] Starting MediaMTX (stream server)..."
 ( cd mediamtx && ./mediamtx ) >"$LOG_DIR/mediamtx.log" 2>&1 &
@@ -70,8 +64,12 @@ echo "[3/4] Starting Backend (AI controller)..."
 PIDS+=("$!")
 sleep 2
 
-echo "[4/4] Starting Frontend (static server on :8080)..."
-( cd frontend && "$PYTHON_BIN" -m http.server 8080 ) >"$LOG_DIR/frontend.log" 2>&1 &
+echo "[4/4] Starting Frontend (Vite SPA on :8080)..."
+if [[ ! -d "frontend/node_modules" ]]; then
+  echo "    First run: installing frontend dependencies (~50s)..."
+  ( cd frontend && npm install ) >"$LOG_DIR/frontend.log" 2>&1
+fi
+( cd frontend && npm run dev ) >>"$LOG_DIR/frontend.log" 2>&1 &
 PIDS+=("$!")
 
 # ── Cleanup on Ctrl-C / script exit ──────────────────────────

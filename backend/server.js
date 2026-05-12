@@ -1085,16 +1085,19 @@ app.get('/person/:name/activity', async (req, res) => {
     );
 
     // Timeline rows carry their camera's lat/lng (when set) so the activity
-    // page can plot a movement path. Self-LEFT-JOIN on user + camera name —
-    // if a camera was renamed or deleted, lat/lng come back NULL and the
-    // frontend simply skips that stop on the path map.
+    // page can plot a movement path. Join on stream_id (stable across
+    // renames); falls back to current camera_name when the incident pre-dates
+    // the stream_id column or the camera was deleted and recreated.
     const [timeline] = await pool.query(
-      `SELECT i.id, i.camera_name AS cameraName, i.confidence,
-              i.snapshot_path AS snapshot, i.created_at AS createdAt,
+      `SELECT i.id,
+              COALESCE(c.camera_name, i.camera_name) AS cameraName,
+              i.confidence,
+              i.snapshot_path AS snapshot,
+              i.created_at AS createdAt,
               c.lat, c.lng
        FROM incidents i
        LEFT JOIN cameras c
-         ON c.user_id = i.user_id AND c.camera_name = i.camera_name
+         ON c.user_id = i.user_id AND c.stream_id = i.stream_id
        WHERE i.user_id = ? AND i.name = ? AND i.type = 'face'
              AND i.created_at >= ? AND i.created_at < ?
        ORDER BY i.created_at DESC LIMIT 100`,
