@@ -11,6 +11,8 @@ const DB_NAME = process.env.DB_NAME || 'ai_cctv';
 
 const ENROLLMENT_ROOT = path.join(__dirname, '..', 'face-ai', 'enrollments');
 
+const ROLES = Object.freeze(['Admin', 'Moderator', 'Visitor']);
+
 const DEFAULT_FEATURES = [
   { name: 'fire_detection',   enabled: 1, description: 'Log fire/smoke incidents detected by the AI worker' },
   { name: 'face_detection',   enabled: 1, description: 'Log recognized face matches as incidents' },
@@ -37,7 +39,23 @@ async function init() {
       id INT AUTO_INCREMENT PRIMARY KEY,
       username VARCHAR(64) NOT NULL UNIQUE,
       password_hash VARCHAR(255) NOT NULL,
+      role VARCHAR(16) NOT NULL DEFAULT 'Visitor',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB
+  `);
+  await ensureColumn('users', 'role', "VARCHAR(16) NOT NULL DEFAULT 'Visitor'");
+  await ensureFirstAdmin();
+
+  // ── failed_logins: audit trail for the "Failed logins (24h)" stat ──
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS failed_logins (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      username VARCHAR(64),
+      user_id INT NULL,
+      ip VARCHAR(64),
+      reason VARCHAR(32),
+      occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_at (occurred_at)
     ) ENGINE=InnoDB
   `);
 
@@ -182,10 +200,25 @@ async function seedAdmin() {
   const username = process.env.ADMIN_USER || 'admin';
   const password = process.env.ADMIN_PASS || 'admin123';
   const hash = await bcrypt.hash(password, 10);
-  const [result] = await pool.query('INSERT INTO users (username, password_hash) VALUES (?, ?)', [username, hash]);
+  const [result] = await pool.query(
+    "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'Admin')",
+    [username, hash],
+  );
   await seedFeaturesFor(result.insertId);
   ensureUserDir(result.insertId);
   console.log(`[DB] Seeded admin user "${username}"`);
+}
+
+// On installs that pre-date the `role` column, every user defaulted to
+// 'Visitor' — including the seeded admin. Promote the lowest-id user to
+// Admin so the dashboard isn't locked out of user management.
+async function ensureFirstAdmin() {
+  const [admins] = await pool.query("SELECT id FROM users WHERE role = 'Admin' LIMIT 1");
+  if (admins.length > 0) return;
+  const [first] = await pool.query('SELECT id FROM users ORDER BY id LIMIT 1');
+  if (first.length === 0) return; // no users yet, seedAdmin() will create one
+  await pool.query("UPDATE users SET role = 'Admin' WHERE id = ?", [first[0].id]);
+  console.log(`[DB] Backfilled role=Admin on user id=${first[0].id}`);
 }
 
 async function seedFeaturesFor(userId) {
@@ -229,15 +262,15 @@ async function migrateLegacyEnrollments() {
   fs.utimesSync(adminDir, new Date(), new Date());
 }
 
-async function createUser(username, password) {
+async function createUser(username, password, role = 'Visitor') {
   const hash = await bcrypt.hash(password, 10);
   const [result] = await pool.query(
-    'INSERT INTO users (username, password_hash) VALUES (?, ?)',
-    [username, hash],
+    'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)',
+    [username, hash, role],
   );
   await seedFeaturesFor(result.insertId);
   ensureUserDir(result.insertId);
-  return { id: result.insertId, username };
+  return { id: result.insertId, username, role };
 }
 
 function getPool() {
@@ -245,4 +278,4 @@ function getPool() {
   return pool;
 }
 
-module.exports = { init, getPool, createUser, seedFeaturesFor, userEnrollmentDir, ensureUserDir };
+module.exports = { init, getPool, createUser, seedFeaturesFor, userEnrollmentDir, ensureUserDir, ROLES };

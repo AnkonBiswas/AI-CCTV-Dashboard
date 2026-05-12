@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { buildAssetUrl } from "@/lib/api";
 import { useDeleteEnrollment, useEnrollments } from "@/hooks/queries";
+import { useAuth } from "@/hooks/useAuth";
 import type { Enrollment } from "@/types/api";
 
 export const Route = createFileRoute("/_app/people")({
@@ -36,6 +37,7 @@ const TYPE_TONES: Record<string, string> = {
 function PeoplePage() {
   const enrollments = useEnrollments();
   const del = useDeleteEnrollment();
+  const { canWrite } = useAuth();
   const [search, setSearch] = useState("");
   const [dialog, setDialog] = useState<
     | { mode: "add" | "edit" | "photos"; target?: Enrollment | null; open: true }
@@ -92,9 +94,11 @@ function PeoplePage() {
               className="border-0 bg-transparent h-7 p-0 text-xs focus-visible:ring-0"
             />
           </div>
-          <Button onClick={() => setDialog({ mode: "add", open: true })}>
-            <Plus className="size-3.5" /> Enroll person
-          </Button>
+          {canWrite && (
+            <Button onClick={() => setDialog({ mode: "add", open: true })}>
+              <Plus className="size-3.5" /> Enroll person
+            </Button>
+          )}
         </div>
 
         {filtered.length === 0 ? (
@@ -108,69 +112,16 @@ function PeoplePage() {
             }
           />
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 p-4">
+          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4 p-4">
             {filtered.map((p) => (
-              <div key={p.name} className="rounded-md border border-border bg-panel-elevated overflow-hidden">
-                <div className="aspect-video bg-background grid place-items-center">
-                  <img
-                    src={buildAssetUrl(`/enrollment/${encodeURIComponent(p.name)}/image`)}
-                    alt={p.name}
-                    className="w-full h-full object-cover"
-                    onError={(e) => {
-                      (e.currentTarget as HTMLImageElement).style.display = "none";
-                    }}
-                  />
-                </div>
-                <div className="p-3 space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <Avatar
-                        initials={(p.name[0] || "?").toUpperCase()}
-                        color="oklch(0.7 0.15 200)"
-                        size={28}
-                      />
-                      <div className="text-sm font-semibold truncate">{p.name}</div>
-                    </div>
-                    <span
-                      className={`text-[10px] text-mono uppercase px-1.5 py-0.5 border rounded ${
-                        TYPE_TONES[p.type] ?? TYPE_TONES.standard
-                      }`}
-                    >
-                      {p.type}
-                    </span>
-                  </div>
-                  <div className="text-[11px] text-muted-foreground text-mono">
-                    {p.photoCount} {p.photoCount === 1 ? "photo" : "photos"}
-                  </div>
-                  <div className="grid grid-cols-4 gap-1.5 pt-1">
-                    <Link
-                      to="/person/$name"
-                      params={{ name: p.name }}
-                      className="h-8 px-2 rounded-md bg-panel hover:bg-background text-[11px] text-mono flex items-center justify-center gap-1"
-                    >
-                      <UserSearch className="size-3" /> Activity
-                    </Link>
-                    <button
-                      onClick={() => setDialog({ mode: "edit", target: p, open: true })}
-                      className="h-8 px-2 rounded-md bg-panel hover:bg-background text-[11px] text-mono flex items-center justify-center gap-1"
-                    >
-                      <Pencil className="size-3" /> Edit
-                    </button>
-                    <button
-                      onClick={() => setDialog({ mode: "photos", target: p, open: true })}
-                      className="h-8 px-2 rounded-md bg-panel hover:bg-background text-[11px] text-mono flex items-center justify-center gap-1"
-                    >
-                      <ImagePlus className="size-3" /> Add
-                    </button>
-                    <button
-                      onClick={() => setRemoving(p)}
-                      className="h-8 px-2 rounded-md bg-panel hover:bg-background text-[11px] text-mono flex items-center justify-center gap-1 text-destructive"
-                    >
-                      <Trash2 className="size-3" />
-                    </button>
-                  </div>
-                </div>
-              </div>
+              <PersonCard
+                key={p.name}
+                person={p}
+                canWrite={canWrite}
+                onEdit={() => setDialog({ mode: "edit", target: p, open: true })}
+                onAddPhotos={() => setDialog({ mode: "photos", target: p, open: true })}
+                onRemove={() => setRemoving(p)}
+              />
             ))}
           </div>
         )}
@@ -202,6 +153,95 @@ function PeoplePage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+    </div>
+  );
+}
+
+function PersonCard({
+  person,
+  canWrite,
+  onEdit,
+  onAddPhotos,
+  onRemove,
+}: {
+  person: Enrollment;
+  canWrite: boolean;
+  onEdit: () => void;
+  onAddPhotos: () => void;
+  onRemove: () => void;
+}) {
+  const [imgFailed, setImgFailed] = useState(false);
+  const initials = (person.name[0] || "?").toUpperCase();
+
+  return (
+    <div className="rounded-xl border border-border bg-panel overflow-hidden flex flex-col group">
+      <div className="relative aspect-[4/5] bg-panel-elevated overflow-hidden">
+        {imgFailed ? (
+          <div className="absolute inset-0 grid place-items-center">
+            <Avatar initials={initials} color="oklch(0.6 0.06 250)" size={64} />
+          </div>
+        ) : (
+          <img
+            src={buildAssetUrl(`/enrollment/${encodeURIComponent(person.name)}/image`)}
+            alt={person.name}
+            className="absolute inset-0 w-full h-full object-cover"
+            onError={() => setImgFailed(true)}
+          />
+        )}
+
+        <div className="absolute top-2 right-2">
+          <span
+            className={`text-[9px] text-mono uppercase tracking-wider px-1.5 py-0.5 border rounded backdrop-blur ${
+              TYPE_TONES[person.type] ?? TYPE_TONES.standard
+            }`}
+          >
+            {person.type}
+          </span>
+        </div>
+
+        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-background/95 via-background/70 to-transparent p-3">
+          <div className="text-sm font-semibold truncate">{person.name}</div>
+          <div className="text-[10px] text-mono text-muted-foreground">
+            {person.photoCount} {person.photoCount === 1 ? "photo" : "photos"}
+          </div>
+        </div>
+      </div>
+
+      <div className="p-2 flex items-center gap-1">
+        <Link
+          to="/person/$name"
+          params={{ name: person.name }}
+          className="flex-1 h-8 px-2 rounded-md bg-panel-elevated hover:bg-background text-[11px] text-mono flex items-center justify-center gap-1.5"
+          title="View activity"
+        >
+          <UserSearch className="size-3" /> Activity
+        </Link>
+        {canWrite && (
+          <>
+            <button
+              onClick={onEdit}
+              className="size-8 rounded-md bg-panel-elevated hover:bg-background grid place-items-center text-muted-foreground hover:text-foreground"
+              title="Edit category"
+            >
+              <Pencil className="size-3.5" />
+            </button>
+            <button
+              onClick={onAddPhotos}
+              className="size-8 rounded-md bg-panel-elevated hover:bg-background grid place-items-center text-muted-foreground hover:text-foreground"
+              title="Add photos"
+            >
+              <ImagePlus className="size-3.5" />
+            </button>
+            <button
+              onClick={onRemove}
+              className="size-8 rounded-md bg-panel-elevated hover:bg-destructive/15 grid place-items-center text-muted-foreground hover:text-destructive"
+              title="Remove"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </>
+        )}
+      </div>
     </div>
   );
 }

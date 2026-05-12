@@ -18,6 +18,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { useCameras, useRemoveCamera } from "@/hooks/queries";
+import { useAuth } from "@/hooks/useAuth";
 
 export const Route = createFileRoute("/_app/cameras")({
   staticData: { title: "Cameras", subtitle: "Live feeds and ingest configuration" },
@@ -27,6 +28,7 @@ export const Route = createFileRoute("/_app/cameras")({
 function CamerasPage() {
   const cameras = useCameras();
   const remove = useRemoveCamera();
+  const { canWrite } = useAuth();
   const [addOpen, setAddOpen] = useState(false);
   const [removing, setRemoving] = useState<{ id: string; name: string } | null>(null);
 
@@ -52,9 +54,11 @@ function CamerasPage() {
           <span className="size-1.5 rounded-full bg-success animate-pulse" />
           {cams.length} {cams.length === 1 ? "feed" : "feeds"}
         </div>
-        <Button onClick={() => setAddOpen(true)}>
-          <Plus className="size-3.5" /> Add camera
-        </Button>
+        {canWrite && (
+          <Button onClick={() => setAddOpen(true)}>
+            <Plus className="size-3.5" /> Add camera
+          </Button>
+        )}
       </div>
 
       {cams.length === 0 ? (
@@ -74,7 +78,10 @@ function CamerasPage() {
               cameraName={c.cameraName}
               hlsUrl={c.hlsUrl}
               pathName={c.pathName}
-              onRemove={() => setRemoving({ id: c.streamId, name: c.cameraName })}
+              showRemove={canWrite}
+              onRemove={
+                canWrite ? () => setRemoving({ id: c.streamId, name: c.cameraName }) : undefined
+              }
             />
           ))}
         </div>

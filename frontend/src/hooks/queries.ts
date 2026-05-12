@@ -8,9 +8,12 @@ import type {
   Camera,
   Enrollment,
   EnrollmentType,
+  FailedLoginsResponse,
   Feature,
   Incident,
+  ManagedUser,
   PersonActivity,
+  UserRole,
 } from "@/types/api";
 
 export function useCameras() {
@@ -178,6 +181,64 @@ export function useUpdateFeature() {
       }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["features"] });
+    },
+  });
+}
+
+// ── User management (Admin only) ─────────────────────────────────────
+
+export function useUsers(enabled = true) {
+  return useQuery({
+    queryKey: ["users"],
+    queryFn: () => api<ManagedUser[]>("/users"),
+    enabled,
+  });
+}
+
+export function useFailedLogins(hours = 24, enabled = true) {
+  return useQuery({
+    queryKey: ["users", "failed-logins", hours],
+    queryFn: () => api<FailedLoginsResponse>("/users/failed-logins", { query: { hours } }),
+    enabled,
+    refetchInterval: 60_000,
+  });
+}
+
+export function useCreateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { username: string; password: string; role: UserRole }) =>
+      api<ManagedUser>("/users", { method: "POST", body }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["users"] });
+    },
+  });
+}
+
+export function useUpdateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, username, role }: { id: number; username?: string; role?: UserRole }) =>
+      api<ManagedUser>(`/users/${id}`, { method: "PUT", body: { username, role } }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["users"] });
+    },
+  });
+}
+
+export function useResetUserPassword() {
+  return useMutation({
+    mutationFn: ({ id, password }: { id: number; password: string }) =>
+      api(`/users/${id}/password`, { method: "PUT", body: { password } }),
+  });
+}
+
+export function useDeleteUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api(`/users/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["users"] });
     },
   });
 }

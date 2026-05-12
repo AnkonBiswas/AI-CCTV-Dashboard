@@ -1,6 +1,23 @@
-export type User = { id: number; username: string };
+export type UserRole = "Admin" | "Moderator" | "Visitor";
+export const USER_ROLES: UserRole[] = ["Admin", "Moderator", "Visitor"];
+
+export type User = { id: number; username: string; role: UserRole };
 
 export type AuthResponse = { token: string; user: User };
+
+export type ManagedUser = {
+  id: number;
+  username: string;
+  role: UserRole;
+  createdAt: string;
+  lastFailed: string | null;
+};
+
+export type FailedLoginsResponse = {
+  hours: number;
+  total: number;
+  recent: { username: string | null; ip: string | null; reason: string | null; occurred_at: string }[];
+};
 
 export type Camera = {
   streamId: string;

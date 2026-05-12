@@ -231,8 +231,200 @@ app.get('/streams/:key', (req, res) => {
 // Everything below requires a valid JWT.
 app.use(auth.httpAuth);
 
-app.get('/me', (req, res) => {
-  res.json({ id: req.user.uid, username: req.user.username });
+app.get('/me', async (req, res) => {
+  try {
+    const [rows] = await db.getPool().query(
+      'SELECT id, username, role FROM users WHERE id = ? LIMIT 1',
+      [req.user.uid],
+    );
+    if (!rows.length) return res.status(401).json({ error: 'unknown user' });
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── User management (Admin only) ─────────────────────────────
+// Returns role, created_at, and last-login timestamp inferred from the audit
+// table when present. The "last login" is best-effort and may be NULL if the
+// user has never authenticated since failed_logins started recording.
+app.get('/users', auth.requireAdmin, async (_req, res) => {
+  try {
+    const [users] = await db.getPool().query(
+      `SELECT u.id, u.username, u.role, u.created_at,
+              (SELECT MAX(occurred_at) FROM failed_logins WHERE user_id = u.id) AS last_failed
+       FROM users u
+       ORDER BY u.id ASC`,
+    );
+    res.json(users.map((u) => ({
+      id: u.id,
+      username: u.username,
+      role: u.role,
+      createdAt: u.created_at,
+      lastFailed: u.last_failed,
+    })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/users', auth.requireAdmin, async (req, res) => {
+  const { username, password, role } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'username and password required' });
+  }
+  if (!/^[a-zA-Z0-9_-]{3,32}$/.test(username)) {
+    return res.status(400).json({ error: 'username must be 3-32 chars: letters, digits, _ or -' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'password must be at least 6 characters' });
+  }
+  const finalRole = db.ROLES.includes(role) ? role : 'Visitor';
+  try {
+    const [exists] = await db.getPool().query('SELECT id FROM users WHERE username = ? LIMIT 1', [username]);
+    if (exists.length) return res.status(409).json({ error: 'username already taken' });
+    const user = await db.createUser(username, password, finalRole);
+    res.status(201).json(user);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/users/:id', auth.requireAdmin, async (req, res) => {
+  const targetId = Number(req.params.id);
+  if (!Number.isInteger(targetId) || targetId <= 0) {
+    return res.status(400).json({ error: 'invalid id' });
+  }
+  const { username, role } = req.body || {};
+  const update = {};
+  if (typeof username === 'string') {
+    if (!/^[a-zA-Z0-9_-]{3,32}$/.test(username)) {
+      return res.status(400).json({ error: 'username must be 3-32 chars: letters, digits, _ or -' });
+    }
+    update.username = username;
+  }
+  if (typeof role === 'string') {
+    if (!db.ROLES.includes(role)) {
+      return res.status(400).json({ error: `role must be one of ${db.ROLES.join(', ')}` });
+    }
+    update.role = role;
+  }
+  if (!Object.keys(update).length) {
+    return res.status(400).json({ error: 'nothing to update' });
+  }
+
+  // Guard rail: never demote the last Admin and never strip yourself of Admin
+  // if you're the only Admin standing. Both leave the install with no path
+  // back into user management without a DB-side override.
+  if (update.role && update.role !== 'Admin') {
+    const [target] = await db.getPool().query('SELECT role FROM users WHERE id = ? LIMIT 1', [targetId]);
+    if (target[0]?.role === 'Admin') {
+      const [admins] = await db.getPool().query("SELECT COUNT(*) AS c FROM users WHERE role = 'Admin'");
+      if (admins[0].c <= 1) {
+        return res.status(409).json({ error: 'cannot demote the last Admin' });
+      }
+    }
+  }
+
+  try {
+    const cols = Object.keys(update);
+    const vals = Object.values(update);
+    const setSql = cols.map((k) => `${k} = ?`).join(', ');
+    const [r] = await db.getPool().query(
+      `UPDATE users SET ${setSql} WHERE id = ?`,
+      [...vals, targetId],
+    );
+    if (r.affectedRows === 0) return res.status(404).json({ error: 'user not found' });
+    const [rows] = await db.getPool().query(
+      'SELECT id, username, role, created_at FROM users WHERE id = ?',
+      [targetId],
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'username already taken' });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/users/:id/password', auth.requireAdmin, async (req, res) => {
+  const targetId = Number(req.params.id);
+  const { password } = req.body || {};
+  if (!Number.isInteger(targetId) || targetId <= 0) {
+    return res.status(400).json({ error: 'invalid id' });
+  }
+  if (!password || password.length < 6) {
+    return res.status(400).json({ error: 'password must be at least 6 characters' });
+  }
+  try {
+    const bcrypt = require('bcryptjs');
+    const hash = await bcrypt.hash(password, 10);
+    const [r] = await db.getPool().query(
+      'UPDATE users SET password_hash = ? WHERE id = ?',
+      [hash, targetId],
+    );
+    if (r.affectedRows === 0) return res.status(404).json({ error: 'user not found' });
+    res.json({ id: targetId, ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/users/:id', auth.requireAdmin, async (req, res) => {
+  const targetId = Number(req.params.id);
+  if (!Number.isInteger(targetId) || targetId <= 0) {
+    return res.status(400).json({ error: 'invalid id' });
+  }
+  if (targetId === req.user.uid) {
+    return res.status(409).json({ error: 'cannot delete yourself' });
+  }
+  // Block deletion of the last Admin for the same reason as demotion.
+  const [target] = await db.getPool().query('SELECT role FROM users WHERE id = ? LIMIT 1', [targetId]);
+  if (target[0]?.role === 'Admin') {
+    const [admins] = await db.getPool().query("SELECT COUNT(*) AS c FROM users WHERE role = 'Admin'");
+    if (admins[0].c <= 1) {
+      return res.status(409).json({ error: 'cannot delete the last Admin' });
+    }
+  }
+  try {
+    // Tear down any of the user's live camera stacks before deleting rows,
+    // otherwise MediaMTX paths + agent processes get orphaned.
+    const [cams] = await db.getPool().query('SELECT stream_id FROM cameras WHERE user_id = ?', [targetId]);
+    for (const c of cams) {
+      try { await teardownCameraStack(c.stream_id); } catch (err) { console.warn('[users delete] teardown failed:', err.message); }
+    }
+    await db.getPool().query('DELETE FROM cameras WHERE user_id = ?', [targetId]);
+    await db.getPool().query('DELETE FROM enrollments WHERE user_id = ?', [targetId]);
+    await db.getPool().query('DELETE FROM features WHERE user_id = ?', [targetId]);
+    await db.getPool().query('DELETE FROM incidents WHERE user_id = ?', [targetId]);
+    const [r] = await db.getPool().query('DELETE FROM users WHERE id = ?', [targetId]);
+    if (r.affectedRows === 0) return res.status(404).json({ error: 'user not found' });
+    res.json({ id: targetId, ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/users/failed-logins', auth.requireAdmin, async (req, res) => {
+  const hours = Number(req.query?.hours) || 24;
+  try {
+    const [[total]] = await db.getPool().query(
+      'SELECT COUNT(*) AS c FROM failed_logins WHERE occurred_at >= NOW() - INTERVAL ? HOUR',
+      [hours],
+    );
+    const [recent] = await db.getPool().query(
+      `SELECT username, ip, reason, occurred_at
+       FROM failed_logins
+       WHERE occurred_at >= NOW() - INTERVAL ? HOUR
+       ORDER BY occurred_at DESC
+       LIMIT 25`,
+      [hours],
+    );
+    res.json({ hours, total: total.c, recent });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Camera helpers ────────────────────────────────────────────
@@ -304,7 +496,7 @@ function parseCoord(v, min, max) {
   return n;
 }
 
-app.post('/add-camera', async (req, res) => {
+app.post('/add-camera', auth.requireWrite, async (req, res) => {
   const userId = req.user.uid;
   const { rtspUrl, cameraName } = req.body || {};
   if (!rtspUrl || !cameraName) {
@@ -340,7 +532,7 @@ app.post('/add-camera', async (req, res) => {
   res.json({ streamId, cameraName, hlsUrl, streamKey: pathName, rtspUrl, agentStarted: true });
 });
 
-app.delete('/camera/:id', async (req, res) => {
+app.delete('/camera/:id', auth.requireWrite, async (req, res) => {
   const userId = req.user.uid;
   const { id } = req.params;
 
@@ -372,7 +564,7 @@ app.get('/cameras', async (req, res) => {
 
 // Update an existing camera's location (used by the map's "drag pin" UX
 // or by editing the camera in the Cameras table).
-app.put('/camera/:id', async (req, res) => {
+app.put('/camera/:id', auth.requireWrite, async (req, res) => {
   const userId = req.user.uid;
   const { id } = req.params;
   const lat = parseCoord(req.body?.lat, -90, 90);
@@ -434,7 +626,7 @@ function writeOnePhoto(dir, safe, base64) {
 // POST /enroll
 //   body: { name, type?, imagesBase64?: string[], imageBase64?: string }   <- legacy single
 // Creates the person if missing, or appends photos to an existing person.
-app.post('/enroll', async (req, res) => {
+app.post('/enroll', auth.requireWrite, async (req, res) => {
   const userId = req.user.uid;
   const { name, type, imageBase64, imagesBase64 } = req.body || {};
   const images = Array.isArray(imagesBase64) ? imagesBase64
@@ -540,7 +732,7 @@ app.get('/enrollments', async (req, res) => {
 });
 
 // PUT /enrollment/:name   body: { type?, notes? }
-app.put('/enrollment/:name', async (req, res) => {
+app.put('/enrollment/:name', auth.requireWrite, async (req, res) => {
   const userId = req.user.uid;
   const safe = sanitizeName(req.params.name);
   if (!safe) return res.status(400).json({ error: 'invalid name' });
@@ -571,7 +763,7 @@ app.put('/enrollment/:name', async (req, res) => {
   }
 });
 
-app.delete('/enrollment/:name', async (req, res) => {
+app.delete('/enrollment/:name', auth.requireWrite, async (req, res) => {
   const userId = req.user.uid;
   const dir = userDir(userId);
   const safe = sanitizeName(req.params.name);
@@ -620,7 +812,7 @@ app.get('/features', async (req, res) => {
   }
 });
 
-app.put('/features/:name', async (req, res) => {
+app.put('/features/:name', auth.requireWrite, async (req, res) => {
   const userId = req.user.uid;
   const { name } = req.params;
   const enabled = req.body?.enabled ? 1 : 0;

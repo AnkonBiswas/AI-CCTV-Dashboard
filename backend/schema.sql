@@ -22,12 +22,31 @@ CREATE DATABASE IF NOT EXISTS `ai_cctv`
 USE `ai_cctv`;
 
 -- ── users ───────────────────────────────────────────────────────────────
+-- role taxonomy:
+--   Admin     — full access, can manage other users
+--   Moderator — manage own cameras/enrollments/features; cannot manage users
+--   Visitor   — read-only
 CREATE TABLE IF NOT EXISTS users (
   id            INT          NOT NULL AUTO_INCREMENT,
   username      VARCHAR(64)  NOT NULL UNIQUE,
   password_hash VARCHAR(255) NOT NULL,
+  role          VARCHAR(16)  NOT NULL DEFAULT 'Visitor',
   created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id)
+) ENGINE=InnoDB;
+
+-- ── failed_logins ───────────────────────────────────────────────────────
+-- Append-only audit of bad credentials, scoped by username + IP. Powers
+-- the "Failed logins (24h)" stat on the User Management page.
+CREATE TABLE IF NOT EXISTS failed_logins (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  username    VARCHAR(64),
+  user_id     INT          NULL,
+  ip          VARCHAR(64),
+  reason      VARCHAR(32),
+  occurred_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  INDEX idx_at (occurred_at)
 ) ENGINE=InnoDB;
 
 -- ── features ────────────────────────────────────────────────────────────
@@ -116,10 +135,10 @@ CREATE TABLE IF NOT EXISTS incidents (
 --   admin → admin123
 --   demo  → demopass1
 --   alice → alicepass1
-INSERT IGNORE INTO users (id, username, password_hash) VALUES
-  (1, 'admin', '$2b$10$UzczzvOTmuSW4aQFgR09R.oECM5u2hU8xjXk8qwA.wOgs8RlK8FH2'),
-  (2, 'demo',  '$2b$10$KC1ni.bKyPo5S/fAMM8nYOaVIU0HtUHZ3wbmd/Egzry2dS6U.pKw6'),
-  (3, 'alice', '$2b$10$UcqmPlg5sm2rb.5n6juKbetXYtvsZwN.5sf7MqWq.vhAU8Fp5gOCq');
+INSERT IGNORE INTO users (id, username, password_hash, role) VALUES
+  (1, 'admin', '$2b$10$UzczzvOTmuSW4aQFgR09R.oECM5u2hU8xjXk8qwA.wOgs8RlK8FH2', 'Admin'),
+  (2, 'demo',  '$2b$10$KC1ni.bKyPo5S/fAMM8nYOaVIU0HtUHZ3wbmd/Egzry2dS6U.pKw6', 'Moderator'),
+  (3, 'alice', '$2b$10$UcqmPlg5sm2rb.5n6juKbetXYtvsZwN.5sf7MqWq.vhAU8Fp5gOCq', 'Visitor');
 
 -- ── default detection features per user ─────────────────────────────────
 INSERT IGNORE INTO features (user_id, name, enabled, description) VALUES

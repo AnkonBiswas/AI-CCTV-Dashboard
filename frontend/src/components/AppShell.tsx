@@ -29,7 +29,18 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { SystemHealthCard } from "@/components/SystemHealthCard";
 
-const nav = [
+import type { UserRole } from "@/types/api";
+
+type NavItem = {
+  to: string;
+  label: string;
+  icon: typeof LayoutGrid;
+  exact?: boolean;
+  badge?: boolean;
+  roles?: UserRole[]; // omit = visible to everyone signed in
+};
+
+const nav: NavItem[] = [
   { to: "/", label: "Live Monitor", icon: LayoutGrid, exact: true },
   { to: "/cameras", label: "Cameras", icon: Video },
   { to: "/people", label: "People Registry", icon: Users },
@@ -37,9 +48,15 @@ const nav = [
   { to: "/tracking", label: "Tracking", icon: RouteIcon },
   { to: "/heatmap", label: "Heatmap", icon: Flame },
   { to: "/incidents", label: "Incidents", icon: AlertTriangle, badge: true },
-  { to: "/users", label: "User Management", icon: Shield },
-  { to: "/settings", label: "Settings", icon: Settings },
+  { to: "/users", label: "User Management", icon: Shield, roles: ["Admin"] },
+  { to: "/settings", label: "Settings", icon: Settings, roles: ["Admin", "Moderator"] },
 ];
+
+const ROLE_BADGE: Record<UserRole, string> = {
+  Admin: "bg-primary/15 text-primary border-primary/30",
+  Moderator: "bg-warning/15 text-warning border-warning/30",
+  Visitor: "bg-muted text-muted-foreground border-border",
+};
 
 type RouteStaticData = { title?: string; subtitle?: string };
 
@@ -50,8 +67,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   const staticData = (last?.staticData ?? {}) as RouteStaticData;
   const title = staticData.title ?? "Klapify AI";
   const subtitle = staticData.subtitle;
-  const { user, logout } = useAuth();
+  const { user, role, logout } = useAuth();
   const [unread, setUnread] = useState(0);
+  const visibleNav = nav.filter((item) => !item.roles || (role && item.roles.includes(role)));
 
   useIncidentLogStream((ev) => {
     if (ev.type === "fire" || ev.type === "smoke") setUnread((n) => n + 1);
@@ -83,7 +101,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             Surveillance
           </div>
           <nav className="space-y-0.5">
-            {nav.map((item) => {
+            {visibleNav.map((item) => {
               const active = item.exact ? pathname === item.to : pathname.startsWith(item.to);
               const Icon = item.icon;
               return (
@@ -130,20 +148,31 @@ export function AppShell({ children }: { children: ReactNode }) {
                   <div className="text-xs font-semibold truncate">
                     {user?.username ?? "Guest"}
                   </div>
-                  <div className="text-[10px] text-muted-foreground">Account</div>
+                  <div className="text-[10px] text-muted-foreground">{role ?? "Account"}</div>
                 </div>
                 <ChevronDown className="size-3.5 text-muted-foreground" />
               </button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-48">
-              <DropdownMenuLabel>{user?.username ?? "Account"}</DropdownMenuLabel>
+            <DropdownMenuContent align="end" className="w-52">
+              <DropdownMenuLabel className="flex items-center gap-2">
+                <span className="truncate">{user?.username ?? "Account"}</span>
+                {role && (
+                  <span
+                    className={`text-[10px] text-mono uppercase px-1.5 py-0.5 border rounded ${ROLE_BADGE[role]}`}
+                  >
+                    {role}
+                  </span>
+                )}
+              </DropdownMenuLabel>
               <DropdownMenuSeparator />
-              <DropdownMenuItem asChild>
-                <Link to="/settings">
-                  <Settings className="size-3.5" />
-                  Settings
-                </Link>
-              </DropdownMenuItem>
+              {(role === "Admin" || role === "Moderator") && (
+                <DropdownMenuItem asChild>
+                  <Link to="/settings">
+                    <Settings className="size-3.5" />
+                    Settings
+                  </Link>
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem onClick={logout} className="text-destructive focus:text-destructive">
                 <LogOut className="size-3.5" />
                 Sign out
