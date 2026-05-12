@@ -25,7 +25,7 @@ export function SystemHealthCard() {
   const storage = data?.storage;
   const storagePct =
     storage && storage.total > 0 ? Math.round((storage.used / storage.total) * 100) : 0;
-  const cpuPct = data?.aiWorker ? 45 : 0;
+  const cpuPct = data?.cpu != null ? Math.round(data.cpu * 100) : null;
 
   return (
     <div className="mx-3 p-3 rounded-md bg-panel-elevated/60 border border-border space-y-2.5">
@@ -39,7 +39,7 @@ export function SystemHealthCard() {
       <Bar label="CPU" pct={cpuPct} />
       <Bar
         label="Storage"
-        pct={storagePct}
+        pct={storage ? storagePct : null}
         caption={storage ? `${fmtBytes(storage.used)} / ${fmtBytes(storage.total)}` : undefined}
       />
     </div>
@@ -55,16 +55,25 @@ function Row({ label, value, ok }: { label: string; value: string; ok?: boolean 
   );
 }
 
-function Bar({ label, pct, caption }: { label: string; pct: number; caption?: string }) {
-  const tone = pct > 90 ? "bg-destructive" : pct > 75 ? "bg-warning" : "bg-primary";
+function Bar({
+  label,
+  pct,
+  caption,
+}: {
+  label: string;
+  pct: number | null;
+  caption?: string;
+}) {
+  const value = pct ?? 0;
+  const tone = value > 90 ? "bg-destructive" : value > 75 ? "bg-warning" : "bg-primary";
   return (
     <div>
       <div className="flex items-center justify-between text-[10px] text-muted-foreground text-mono uppercase tracking-wider">
         <span>{label}</span>
-        <span>{pct}%</span>
+        <span>{pct == null ? "—" : `${value}%`}</span>
       </div>
       <div className="mt-1 h-1.5 rounded-full bg-background overflow-hidden">
-        <div className={`h-full ${tone}`} style={{ width: `${Math.min(100, pct)}%` }} />
+        <div className={`h-full ${tone}`} style={{ width: `${Math.min(100, value)}%` }} />
       </div>
       {caption && <div className="mt-1 text-[10px] text-muted-foreground text-mono">{caption}</div>}
     </div>

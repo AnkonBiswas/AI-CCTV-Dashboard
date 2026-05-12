@@ -8,6 +8,7 @@ const { spawn } = require('child_process');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 const db = require('./db');
 const auth = require('./auth');
@@ -915,7 +916,9 @@ app.get('/incidents', async (req, res) => {
 // ── System health ─────────────────────────────────────────────
 const SERVER_BOOT = Date.now();
 
-app.get('/system-health', async (_req, res) => {
+app.get('/system-health', async (req, res) => {
+  const userId = req.user.uid;
+
   let mediamtx = false;
   try {
     await axios.get(`${MEDIAMTX_API}/v3/config/global/get`, { timeout: 1500 });
@@ -932,9 +935,23 @@ app.get('/system-health', async (_req, res) => {
     storage = { total, free, used: total - free };
   } catch { /* statfs not supported */ }
 
+  // Per-user camera count. activeStreams is global (all users' live cameras
+  // share one map), so filter by ownership instead of using map.size. Demo
+  // seeds (rtsp://demo.*) are registered but never go live — exclude them
+  // so the badge reflects real running streams only.
   const cameras = { live: 0, connecting: 0, offline: 0 };
-  // Frontend tracks per-tile state; backend only knows what it spawned.
-  for (const _ of activeStreams.values()) cameras.live++;
+  for (const s of activeStreams.values()) {
+    if (s.userId !== userId) continue;
+    if (typeof s.rtspUrl === 'string' && s.rtspUrl.startsWith(DEMO_RTSP_PREFIX)) continue;
+    cameras.live += 1;
+  }
+
+  // Real system CPU% sampled over a short window. os.cpus() returns total
+  // user/sys/idle/etc ticks since boot; diff two snapshots = utilization.
+  let cpu = null;
+  try {
+    cpu = await sampleCpuUsage(200);
+  } catch { /* on platforms where os.cpus() returns empty */ }
 
   res.json({
     uptimeMs: Date.now() - SERVER_BOOT,
@@ -942,8 +959,29 @@ app.get('/system-health', async (_req, res) => {
     aiWorker,
     storage,
     cameras,
+    cpu,
   });
 });
+
+function cpuSnapshot() {
+  let total = 0;
+  let idle = 0;
+  for (const c of os.cpus()) {
+    for (const v of Object.values(c.times)) total += v;
+    idle += c.times.idle;
+  }
+  return { total, idle };
+}
+
+async function sampleCpuUsage(windowMs) {
+  const a = cpuSnapshot();
+  await new Promise((r) => setTimeout(r, windowMs));
+  const b = cpuSnapshot();
+  const tDiff = b.total - a.total;
+  const iDiff = b.idle - a.idle;
+  if (tDiff <= 0) return 0;
+  return Math.max(0, Math.min(1, 1 - iDiff / tDiff));
+}
 
 // ── Analytics (per user) ──────────────────────────────────────
 app.get('/analytics', async (req, res) => {

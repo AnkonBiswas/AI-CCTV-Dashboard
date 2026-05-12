@@ -130,8 +130,9 @@ export type SystemHealth = {
   uptimeMs: number;
   mediamtx: boolean;
   aiWorker: boolean;
-  storage: { total: number; free: number; used: number };
+  storage: { total: number; free: number; used: number } | null;
   cameras: { live: number; connecting: number; offline: number };
+  cpu: number | null;
 };
 
 export type Detection = {
