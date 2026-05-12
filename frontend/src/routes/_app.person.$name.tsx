@@ -96,7 +96,7 @@ function PersonActivityPage() {
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground text-mono">
             Hourly activity
           </div>
-          <div className="mt-4 flex items-end gap-1 h-32">
+          <div className="mt-4 flex gap-1 h-32">
             {byHour.map((v: number, h: number) => (
               <div key={h} className="flex-1 flex flex-col items-center gap-1">
                 <div className="w-full flex-1 flex items-end">

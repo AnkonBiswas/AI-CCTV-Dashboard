@@ -122,7 +122,7 @@ function Dashboard() {
                   Full report <ArrowUpRight className="size-3" />
                 </Link>
               </div>
-              <div className="mt-6 flex items-end gap-2 h-32">
+              <div className="mt-6 flex gap-2 h-32">
                 {hours.length === 0 ? (
                   <div className="text-xs text-muted-foreground text-mono w-full text-center pt-10">
                     No detections in the last 24h.
@@ -177,7 +177,7 @@ function Dashboard() {
                 <CheckCircle2 className="size-3.5" /> ROLLING 7D
               </div>
             </div>
-            <div className="mt-5 flex items-end gap-2 h-24">
+            <div className="mt-5 flex gap-2 h-24">
               {weekDays.length === 0 ? (
                 <div className="text-xs text-muted-foreground text-mono w-full text-center pt-6">
                   No data yet
