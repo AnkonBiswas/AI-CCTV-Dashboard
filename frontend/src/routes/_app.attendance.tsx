@@ -109,25 +109,31 @@ function AttendancePage() {
   const totalEnrolled = enrolled.length || 0;
 
   function exportCsv() {
-    const headers = ["day", "name", "detections", "firstSeen", "lastSeen", "cameras"];
+    const headers = ["Date", "Name", "Detections", "Check-in", "Last seen", "Hours", "Cameras"];
     const lines = [headers.join(",")];
     for (const r of rows) {
+      const hours =
+        r.firstSeen && r.lastSeen ? diffHm(r.firstSeen, r.lastSeen) : "";
       lines.push(
         [
-          r.day,
+          // Force-text formula so Excel doesn't auto-convert and squash the
+          // date into the ######## state.
+          excelText(r.day),
           escapeCsv(r.name),
           r.n,
-          r.firstSeen ?? "",
-          r.lastSeen ?? "",
+          excelText(r.firstSeen ? formatTime(r.firstSeen) : ""),
+          excelText(r.lastSeen ? formatTime(r.lastSeen) : ""),
+          excelText(hours),
           escapeCsv(r.cameras.join("; ")),
         ].join(","),
       );
     }
-    const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+    // BOM so Excel opens it as UTF-8 (preserves non-ASCII names).
+    const blob = new Blob(["\uFEFF", lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `attendance-${range}.csv`;
+    a.download = `attendance-${range}-${today}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -424,4 +430,13 @@ function localISODate(d: Date): string {
 function escapeCsv(s: string): string {
   if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
+}
+
+// Wraps a value so Excel keeps it as literal text instead of auto-converting
+// "2026-05-12" → a Date that overflows the column and renders as ########.
+// The `="..."` formula form works in Excel, Numbers, and LibreOffice; CSV
+// parsers that don't know about it simply see the equals and quotes as data.
+function excelText(s: string): string {
+  if (!s) return "";
+  return `="${String(s).replace(/"/g, '""')}"`;
 }
