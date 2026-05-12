@@ -122,10 +122,16 @@ export function LeafletMap(props: Props) {
     window.setTimeout(() => map.invalidateSize(), 200);
   }
 
+  // `isolate` + `z-0` creates a new stacking context so Leaflet's internal
+  // z-indexes (tile panes up to 700, controls at 1000) stay clamped under this
+  // container's level. Without it, the zoom buttons sit above any dialog
+  // overlay (which uses z-50 in shadcn).
   return (
     <div
       ref={containerRef}
-      className={props.className ?? "h-[420px] w-full rounded-xl border border-border bg-panel"}
+      className={`isolate relative z-0 ${
+        props.className ?? "h-[420px] w-full rounded-xl border border-border bg-panel"
+      }`}
     />
   );
 }

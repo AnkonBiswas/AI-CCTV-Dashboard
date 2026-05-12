@@ -242,9 +242,13 @@ def train_recognizer(dir_path):
 # ── Per-stream thread ─────────────────────────────────────────
 active_streams = {}
 
-# Detection target rate (frames *processed* per second). The capture thread
-# always reads at the camera's full rate; this just throttles the AI step.
-TARGET_FPS = 8
+# Detection target rate (frames *processed* per second, per stream when only
+# one camera is active). MediaPipe, YOLO, and FaceNet all share a single
+# instance behind locks, so total system inferences/sec is fixed by hardware.
+# At runtime we divide this budget across the currently active streams so
+# adding a second camera doesn't starve the first — see `current_period()`.
+# Override via env var when tuning for the host's actual CPU/GPU headroom.
+TARGET_FPS = int(os.environ.get('AI_TARGET_FPS', '16'))
 
 class LatestFrameReader:
     """Always-fresh frame source.
@@ -307,6 +311,19 @@ class LatestFrameReader:
         self.stop_event.set()
 
 
+def current_period():
+    """Per-stream throttle period that auto-scales with active stream count.
+
+    With N streams running, each gets 1/N of TARGET_FPS so the *total* system
+    inference rate stays at ~TARGET_FPS regardless of N. This keeps lock
+    contention bounded — without it, all N threads pound the shared model
+    locks at TARGET_FPS each and the OS scheduler decides who wins, which is
+    visibly unfair (newer streams get crowded out).
+    """
+    n = max(1, len(active_streams))
+    return n / float(TARGET_FPS)
+
+
 def stream_worker(stream_id, rtsp_url, enrollment_dir):
     stop_event = active_streams[stream_id]['stop']
     log({'type': 'info', 'message': f'Stream worker started: {stream_id} (enroll dir: {enrollment_dir})'})
@@ -315,7 +332,6 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
     last_processed_at = 0
     last_incident_snap_at = 0   # fire/smoke
     last_face_snap_at     = 0   # recognized faces
-    period = 1.0 / TARGET_FPS
 
     # For incident heuristics (e.g. fight)
     person_history = collections.deque(maxlen=10) # Track person counts/locations
@@ -332,8 +348,10 @@ def stream_worker(stream_id, rtsp_url, enrollment_dir):
         while not stop_event.is_set():
             now = time.time()
 
-            # Throttle to TARGET_FPS so AI processing doesn't peg the CPU.
-            if now - last_processed_at < period:
+            # Throttle to AI_TARGET_FPS / N_streams so adding cameras divides
+            # the shared model budget fairly. Recompute every iteration so
+            # the rate adapts immediately when cameras are added/removed.
+            if now - last_processed_at < current_period():
                 time.sleep(0.005)
                 continue
 
