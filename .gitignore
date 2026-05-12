@@ -72,6 +72,9 @@ face-ai/enrollments/*.jpeg
 face-ai/enrollments/*.png
 !face-ai/enrollments/.gitkeep
 
+# Incident snapshots — generated at runtime per camera, can grow unbounded
+face-ai/snapshots/
+
 # Local configurations / test files
 backend/add_camera.json
 mediamtx/test_path.json

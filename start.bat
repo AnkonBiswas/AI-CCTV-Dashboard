@@ -22,10 +22,14 @@ cd ..\backend
 start "Dashboard Backend" /min npm start
 timeout /t 2 /nobreak >nul
 
-:: Start Frontend
-echo [4/4] Starting Frontend (Interface)...
+:: Start Frontend (Vite dev server)
+echo [4/4] Starting Frontend (Vite SPA)...
 cd ..\frontend
-start "Dashboard Frontend" /min python -m http.server 8080
+if not exist "node_modules" (
+  echo     First run: installing frontend dependencies, this can take a minute...
+  call npm install
+)
+start "Dashboard Frontend" /min npm run dev
 
 echo.
 echo ==========================================

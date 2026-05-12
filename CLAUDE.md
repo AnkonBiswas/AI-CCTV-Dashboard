@@ -13,19 +13,32 @@ Multi-camera RTSP dashboard with live person/face detection, name recognition, a
 
 ## Running the stack
 
-`start.bat` from the repo root launches MediaMTX, backend, and frontend in separate minimized windows. **It first kills any existing `node.exe`, `python.exe`, and `mediamtx.exe`** to avoid port conflicts — be aware if you have unrelated Python/Node processes running.
+`start.bat` from the repo root launches MediaMTX, backend, and frontend in separate minimized windows. **It first kills any existing `node.exe`, `python.exe`, and `mediamtx.exe`** to avoid port conflicts — be aware if you have unrelated Python/Node processes running. The first launch installs frontend `node_modules` (~50s); subsequent launches skip that step.
 
 Manual equivalents:
 
 - **MediaMTX** — `cd mediamtx && ./mediamtx.exe` (must start first; backend POSTs to its API at boot of each camera).
 - **Backend** — `cd backend && npm start` (or `npm run dev` for nodemon). Listens on `:3000`. Spawns the master AI worker on startup.
-- **Frontend** — `cd frontend && python -m http.server 8080`. Static files only; no build step.
+- **Frontend** — `cd frontend && npm run dev`. Vite SPA served on `:8080`. Production build: `npm run build` → `dist/`, then any static server (or `npm run preview`).
 
 Python deps for the AI worker: `ultralytics`, `opencv-python` (with `opencv-contrib-python` for `cv2.face.LBPHFaceRecognizer_create`), `mediapipe`, `numpy`. The agent (`agent/agent.py`) needs FFmpeg on PATH; on Windows it auto-downloads a portable `ffmpeg.exe` into `agent/` if missing.
 
 `PYTHON` env var overrides the interpreter the backend spawns for both `detect.py` and `agent.py` (defaults to `python`).
 
 There is no test suite (`npm test` is a stub). `TESTING.md` is currently empty.
+
+## Frontend stack
+
+The frontend is a Vite SPA (React 19 + TanStack Router + Tailwind v4 + shadcn/ui) backed by TanStack Query for HTTP and a Socket.IO singleton for live events. Key paths:
+
+- [frontend/src/main.tsx](frontend/src/main.tsx) bootstraps the router under `AuthProvider` + `SocketProvider`.
+- [frontend/src/routes/](frontend/src/routes/) — file-based routing. `_app.*` are auth-guarded under [_app.tsx](frontend/src/routes/_app.tsx); `_auth.*` host login/signup.
+- [frontend/src/components/CameraTile.tsx](frontend/src/components/CameraTile.tsx) handles WebRTC (WHEP)→HLS fallback, bbox overlays via [DetectionCanvas.tsx](frontend/src/components/DetectionCanvas.tsx), and screenshot/record/fullscreen tools.
+- [frontend/src/lib/api.ts](frontend/src/lib/api.ts) is the typed fetch wrapper with JWT injection and a global 401 handler. Base URL is `VITE_API_URL` (defaults to `http://<hostname>:3000`); WebRTC base is `VITE_WEBRTC_URL` (defaults to `:8889`).
+- [frontend/src/hooks/queries.ts](frontend/src/hooks/queries.ts) wraps every backend endpoint as a React Query hook — start there when adding a feature.
+- [frontend/legacy/](frontend/legacy/) holds the prior static HTML/JS implementation for reference only. Do not import from it.
+
+The hls.js / leaflet / socket.io dependencies are bundled per-route via TanStack Router's `autoCodeSplitting`. Build output goes to `frontend/dist/`.
 
 ## Architecture
 
